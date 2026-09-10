@@ -1,0 +1,389 @@
+{{/*
+Folder name expression handed to yq. A non-empty rules.folder collapses every
+PrometheusRule into that one folder; otherwise rules.namespaceExpr decides, which
+normally yields one folder per resource.
+
+The folder name is read from the environment rather than inlined, because the yq
+program is embedded in a single quoted shell string: a folder such as
+"Bob's Alerts" would otherwise terminate that string and break the script.
+rules.namespaceExpr and rules.groupNameExpr are yq code by definition and are
+inlined, which is why they are documented as trusted input.
+*/}}
+{{- $namespaceExpr := .Values.rules.namespaceExpr -}}
+{{- if .Values.rules.folder -}}
+{{- $namespaceExpr = "strenv(RULES_FOLDER)" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  download-tools.sh: |
+    #!/bin/sh
+    # Resolves and installs the CLI tools the sync loop needs into TOOLS_DIR.
+    #
+    # Per tool the precedence is: explicit URL, then pinned version, then the
+    # binary already present in the base image, then the latest release.
+    set -eu
+    if [ "${DEBUG:-false}" = "true" ]; then
+      set -x
+    fi
+
+    : "${TOOLS_DIR:=/tools}"
+
+    case "$(uname -m)" in
+      x86_64 | amd64) ARCH=amd64 ;;
+      aarch64 | arm64) ARCH=arm64 ;;
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+    echo "architecture: ${ARCH}"
+
+    fetch() {
+      _dest="$1"
+      _url="$2"
+      echo "downloading ${_url}"
+      curl --fail --silent --show-error --location \
+           --retry 5 --retry-delay 2 --retry-connrefused \
+           --connect-timeout 10 --max-time 300 \
+           --output "${_dest}" "${_url}"
+      chmod 0755 "${_dest}"
+    }
+
+    # Strips a leading "v" so that both "3.2.1" and "v3.2.1" work in values.
+    plain_version() {
+      echo "${1#v}"
+    }
+
+    # ------------------------------------------------------------- mimirtool
+    # Always downloaded: the official grafana/mimirtool image is distroless, so
+    # the binary cannot be taken from an image at runtime.
+    if [ -n "${MIMIRTOOL_URL:-}" ]; then
+      mimirtool_url="${MIMIRTOOL_URL}"
+    elif [ -n "${MIMIRTOOL_VERSION:-}" ]; then
+      mimirtool_url="https://github.com/grafana/mimir/releases/download/mimir-$(plain_version "${MIMIRTOOL_VERSION}")/mimirtool-linux-${ARCH}"
+    else
+      mimirtool_url="https://github.com/grafana/mimir/releases/latest/download/mimirtool-linux-${ARCH}"
+    fi
+    fetch "${TOOLS_DIR}/mimirtool" "${mimirtool_url}"
+
+    # ---------------------------------------------------------------- kubectl
+    if [ -n "${KUBECTL_URL:-}" ]; then
+      fetch "${TOOLS_DIR}/kubectl" "${KUBECTL_URL}"
+    elif [ -n "${KUBECTL_VERSION:-}" ]; then
+      fetch "${TOOLS_DIR}/kubectl" \
+        "https://dl.k8s.io/release/v$(plain_version "${KUBECTL_VERSION}")/bin/linux/${ARCH}/kubectl"
+    elif [ "${FORCE_DOWNLOAD:-false}" = "true" ] || ! command -v kubectl >/dev/null 2>&1; then
+      kubectl_stable="$(curl --fail --silent --show-error --location --retry 5 https://dl.k8s.io/release/stable.txt)"
+      fetch "${TOOLS_DIR}/kubectl" \
+        "https://dl.k8s.io/release/${kubectl_stable}/bin/linux/${ARCH}/kubectl"
+    else
+      echo "kubectl: using $(command -v kubectl) from the image"
+    fi
+
+    # --------------------------------------------------------------------- yq
+    if [ -n "${YQ_URL:-}" ]; then
+      fetch "${TOOLS_DIR}/yq" "${YQ_URL}"
+    elif [ -n "${YQ_VERSION:-}" ]; then
+      fetch "${TOOLS_DIR}/yq" \
+        "https://github.com/mikefarah/yq/releases/download/v$(plain_version "${YQ_VERSION}")/yq_linux_${ARCH}"
+    elif [ "${FORCE_DOWNLOAD:-false}" = "true" ] || ! command -v yq >/dev/null 2>&1; then
+      fetch "${TOOLS_DIR}/yq" \
+        "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${ARCH}"
+    else
+      echo "yq: using $(command -v yq) from the image"
+    fi
+
+    # Executing each tool doubles as a smoke test: a wrong architecture or an
+    # HTML error page saved as a binary fails the pod here at init rather than
+    # halfway through a sync.
+    PATH="${TOOLS_DIR}:${PATH}"
+    export PATH
+    echo "--- tool versions ---"
+    mimirtool version
+    kubectl version --client
+    yq --version
+
+  sync-once.sh: |
+    #!/bin/sh
+    # Renders every matching PrometheusRule into mimirtool rule files, validates
+    # them, and pushes them to Grafana when something changed.
+    set -eu
+    if [ "${DEBUG:-false}" = "true" ]; then
+      set -x
+    fi
+
+    : "${TOOLS_DIR:=/tools}"
+    : "${RULES_DIR:=/tmp/rules}"
+    : "${STATE_DIR:=/tmp/state}"
+    : "${SYNC_CONCURRENCY:=1}"
+    : "${FULL_SYNC_INTERVAL_SECONDS:=300}"
+
+    PATH="${TOOLS_DIR}:${PATH}"
+    export PATH
+
+    stage_dir="${RULES_DIR}.stage"
+    hash_file="${STATE_DIR}/rules.sha256"
+    last_push_file="${STATE_DIR}/last-push"
+    raw_file="${STATE_DIR}/prometheusrules.json"
+
+    mkdir -p "${STATE_DIR}"
+    rm -rf "${stage_dir}"
+    mkdir -p "${stage_dir}"
+
+    # ------------------------------------------------ 1. read from the cluster
+    set -- prometheusrules.monitoring.coreos.com --all-namespaces --output=json
+    if [ -n "${RULE_LABEL_SELECTOR:-}" ]; then
+      set -- "$@" "--selector=${RULE_LABEL_SELECTOR}"
+    fi
+    kubectl get "$@" > "${raw_file}"
+
+    # -------------------------------------------------------- 2. transform
+    # Keeps alerting rules only, drops recording rules and any group or rule
+    # key that the Grafana conversion endpoint does not accept.
+    #
+    # A rule counts as alerting only if it has a non-empty `alert` and no
+    # `record` at all. Testing for `alert` alone is not enough: a rule carrying
+    # both keys, or an `alert: ""` next to a `record`, is a recording rule that
+    # would otherwise be pushed to Grafana as a nameless alert.
+    #
+    # The mimirtool namespace becomes the Grafana folder. PrometheusRules that
+    # resolve to the same folder are merged into one document, and one file is
+    # written per folder, because a mimirtool rule file holds exactly one
+    # namespace.
+    (
+      cd "${stage_dir}"
+      yq --input-format=json --output-format=yaml \
+        --split-exp '(.namespace | sub("[^A-Za-z0-9_.-]", "_"))' \
+        '
+        [
+          .items[]
+          | .metadata as $m
+          | select($m.namespace | test(strenv(INCLUDE_NAMESPACES_REGEX)))
+          | select($m.namespace | test(strenv(EXCLUDE_NAMESPACES_REGEX)) | not)
+          | select(
+              ($m.annotations // {})
+              | to_entries
+              | any_c(.key == strenv(IGNORE_ANNOTATION) and .value == "true")
+              | not
+            )
+          | {
+              "namespace": ({{ $namespaceExpr }}),
+              "groups": [
+                .spec.groups[]
+                | {
+                    "name": ({{ .Values.rules.groupNameExpr }}),
+                    "interval": .interval,
+                    "rules": [
+                      .rules[]
+                      | select(has("alert") and (has("record") | not))
+                      | select((.alert // "") != "")
+                      | pick(["alert", "expr", "for", "keep_firing_for", "labels", "annotations"])
+                    ]
+                  }
+                | with_entries(select(.value != null))
+                | select(.rules | length > 0)
+              ]
+            }
+          | select(.groups | length > 0)
+        ]
+        | group_by(.namespace)
+        | map({"namespace": .[0].namespace, "groups": [.[].groups[]]})
+        | .[]
+        ' "${raw_file}"
+    )
+
+    # An unmatched glob stays literal in POSIX sh, so probe before using it.
+    set -- "${stage_dir}"/*.yml
+    [ -e "$1" ] || set --
+
+    # ------------------------------------------------------- 3. validate
+    if [ "$#" -eq 0 ]; then
+      if [ "${ALLOW_EMPTY:-false}" != "true" ]; then
+        echo "no PrometheusRule with alerting rules matched; skipping sync." \
+             "Set sync.allowEmpty=true to let this delete every imported rule from Grafana." >&2
+        exit 0
+      fi
+      echo "no PrometheusRule with alerting rules matched;" \
+           "syncing an empty rule set will remove every imported rule from Grafana" >&2
+    else
+      echo "rendered $# rule file(s)"
+
+      # Independent check of the transform's own invariant: every emitted group
+      # holds at least one rule, and every rule is an alerting rule. Grafana
+      # accepts recording rules on this endpoint, so a regression in the yq
+      # program above would silently create them instead of erroring out.
+      #
+      # The test is a non-empty `alert` rather than the absence of `record`:
+      # `pick` strips `record` unconditionally, so a recording rule that got
+      # past the filter arrives here as a rule with no name at all.
+      leaked="$(
+        yq -r '
+          .groups[]
+          | select(
+              ((.rules // []) | length == 0)
+              or ([.rules[] | select(has("record") or ((.alert // "") == ""))] | length > 0)
+            )
+          | .name
+        ' "$@"
+      )"
+      if [ -n "${leaked}" ]; then
+        echo "refusing to sync: the transform emitted group(s) that are empty or still" \
+             "contain a recording rule. This is a bug in the chart:" >&2
+        echo "${leaked}" >&2
+        exit 1
+      fi
+
+      mimirtool rules check "$@"
+    fi
+
+    # Promote the staged render so that the last valid rule set stays available
+    # for inspection with `kubectl exec ... -- ls /tmp/rules`.
+    rm -rf "${RULES_DIR}"
+    mv "${stage_dir}" "${RULES_DIR}"
+
+    # ---------------------------------------- 4. decide whether to push
+    # Filenames are part of the hash so that a renamed PrometheusRule counts as
+    # a change. The glob is sorted, which keeps the hash stable across runs.
+    new_hash="$(
+      cd "${RULES_DIR}" || exit 1
+      for f in *.yml; do
+        [ -e "${f}" ] || continue
+        printf '%s\n' "${f}"
+        cat "${f}"
+      done | sha256sum | cut -d' ' -f1
+    )"
+    old_hash="$(cat "${hash_file}" 2>/dev/null || echo "")"
+    last_push="$(cat "${last_push_file}" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+
+    changed=true
+    [ "${new_hash}" = "${old_hash}" ] && changed=false
+
+    full_sync_due=false
+    if [ "${FULL_SYNC_INTERVAL_SECONDS}" -gt 0 ] && \
+       [ "$(( now - last_push ))" -ge "${FULL_SYNC_INTERVAL_SECONDS}" ]; then
+      full_sync_due=true
+    fi
+
+    if [ "${changed}" = "false" ] && [ "${full_sync_due}" = "false" ]; then
+      if [ "${FULL_SYNC_INTERVAL_SECONDS}" -gt 0 ]; then
+        echo "unchanged (${new_hash}); next periodic push in $(( FULL_SYNC_INTERVAL_SECONDS - (now - last_push) ))s"
+      else
+        echo "unchanged (${new_hash}); periodic push disabled"
+      fi
+      exit 0
+    fi
+
+    if [ "${changed}" = "true" ]; then
+      echo "rule set changed (${old_hash:-none} -> ${new_hash})"
+    else
+      echo "rule set unchanged; pushing anyway to repair drift in Grafana"
+    fi
+
+    # -------------------------------------------------------- 5. push
+    set --
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+      set -- rules diff
+    else
+      set -- rules sync "--concurrency=${SYNC_CONCURRENCY}"
+    fi
+    if [ "${GRAFANA_TLS_SKIP_VERIFY:-false}" = "true" ]; then
+      set -- "$@" --tls-skip-verify
+    fi
+    if [ -n "${GRAFANA_TLS_CA_PATH:-}" ]; then
+      set -- "$@" "--tls-ca-path=${GRAFANA_TLS_CA_PATH}"
+    fi
+    if [ -n "${MIMIRTOOL_EXTRA_ARGS:-}" ]; then
+      # Intentionally word split so that sync.extraArgs can add several flags.
+      # shellcheck disable=SC2086
+      set -- "$@" ${MIMIRTOOL_EXTRA_ARGS}
+    fi
+    # A directory rather than a file list, so that an empty rule set is a valid
+    # input meaning "no rules" instead of an unexpanded glob.
+    set -- "$@" "--rule-dirs=${RULES_DIR}"
+
+    mimirtool "$@"
+
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+      echo "dry run: nothing was written to Grafana"
+    else
+      echo "${new_hash}" > "${hash_file}"
+      echo "${now}" > "${last_push_file}"
+      echo "push completed"
+    fi
+
+  loop.sh: |
+    #!/bin/sh
+    # Runs sync-once.sh forever. A failing iteration is logged and retried on
+    # the next tick rather than crashing the container, because the usual causes
+    # (Grafana restarting, an expired token) are not fixed by a restart.
+    set -u
+
+    : "${SYNC_INTERVAL_SECONDS:=30}"
+    : "${SYNC_TIMEOUT_SECONDS:=300}"
+    : "${HEARTBEAT_FILE:=/tmp/heartbeat}"
+
+    script_dir="$(dirname "$0")"
+    terminate=0
+    trap 'terminate=1' TERM INT
+
+    echo "promrule-to-grafanarule-converter starting: interval ${SYNC_INTERVAL_SECONDS}s, timeout ${SYNC_TIMEOUT_SECONDS}s"
+
+    while [ "${terminate}" -eq 0 ]; do
+      if timeout "${SYNC_TIMEOUT_SECONDS}" "${script_dir}/sync-once.sh"; then
+        :
+      else
+        rc=$?
+        # 124 is coreutils timeout, 143 is busybox timeout killing with SIGTERM.
+        case "${rc}" in
+          124 | 143)
+            echo "iteration timed out after ${SYNC_TIMEOUT_SECONDS}s; retrying in ${SYNC_INTERVAL_SECONDS}s" >&2
+            ;;
+          *)
+            echo "iteration failed with exit code ${rc}; retrying in ${SYNC_INTERVAL_SECONDS}s" >&2
+            ;;
+        esac
+      fi
+
+      # Marks the loop as alive regardless of the iteration result, so the
+      # liveness probe restarts a stuck loop but leaves a pod that is merely
+      # reporting sync errors running and readable.
+      date +%s > "${HEARTBEAT_FILE}"
+
+      [ "${terminate}" -eq 1 ] && break
+
+      # Backgrounded so that SIGTERM interrupts the wait instead of having to
+      # sit out the full interval.
+      sleep "${SYNC_INTERVAL_SECONDS}" &
+      wait "$!" 2>/dev/null || true
+    done
+
+    echo "promrule-to-grafanarule-converter stopped"
+
+  healthcheck.sh: |
+    #!/bin/sh
+    # Fails when the sync loop stopped iterating.
+    set -eu
+
+    : "${HEARTBEAT_FILE:=/tmp/heartbeat}"
+    : "${HEARTBEAT_MAX_AGE_SECONDS:=120}"
+
+    if [ ! -f "${HEARTBEAT_FILE}" ]; then
+      echo "no heartbeat yet at ${HEARTBEAT_FILE}"
+      exit 1
+    fi
+
+    age=$(( $(date +%s) - $(cat "${HEARTBEAT_FILE}") ))
+    if [ "${age}" -gt "${HEARTBEAT_MAX_AGE_SECONDS}" ]; then
+      echo "last iteration finished ${age}s ago, limit is ${HEARTBEAT_MAX_AGE_SECONDS}s"
+      exit 1
+    fi
+
+    echo "ok, last iteration finished ${age}s ago"

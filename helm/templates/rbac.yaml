@@ -1,0 +1,41 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+  labels:
+    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  # Read-only. The sync loop polls PrometheusRules across all namespaces and
+  # never writes back to the cluster.
+  - apiGroups:
+      - monitoring.coreos.com
+    resources:
+      - prometheusrules
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+  labels:
+    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "promrule-to-grafanarule-converter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

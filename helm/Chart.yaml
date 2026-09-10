@@ -1,0 +1,21 @@
+apiVersion: v2
+name: promrule-to-grafanarule-converter
+description: Continuously mirrors PrometheusRule alerting rules from all namespaces into a Grafana instance as Grafana-managed alert rules, using mimirtool against the Grafana /api/convert/ endpoint.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - prometheus
+  - prometheusrule
+  - grafana
+  - alerting
+  - mimirtool
+annotations:
+  artifacthub.io/operator: "false"
+  artifacthub.io/crds: |
+    - kind: PrometheusRule
+      version: v1
+      name: prometheusrules.monitoring.coreos.com
+      displayName: Prometheus rule
+      description: Read-only. Alerting rules are read from every namespace and mirrored into Grafana.

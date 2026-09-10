@@ -1,0 +1,57 @@
+{{ .Chart.Name }} {{ .Chart.Version }} is installed as {{ include "promrule-to-grafanarule-converter.fullname" . }}.
+
+PrometheusRule alerting rules are mirrored into Grafana every {{ .Values.sync.interval }}.
+
+  Target:      {{ include "promrule-to-grafanarule-converter.mimirAddress" . }}
+  Data source: {{ .Values.grafana.datasourceUID }}
+  Folders:     {{ include "promrule-to-grafanarule-converter.folderDescription" . }}
+  Namespaces:  {{ if .Values.rules.namespaces }}{{ join ", " .Values.rules.namespaces }}{{ else }}all{{ end }}
+  {{- if .Values.rules.excludeNamespaces }}
+  Excluded:    {{ join ", " .Values.rules.excludeNamespaces }}
+  {{- end }}
+  {{- if .Values.rules.labelSelector }}
+  Selector:    {{ .Values.rules.labelSelector }}
+  {{- end }}
+
+Follow the sync loop:
+
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "promrule-to-grafanarule-converter.name" . }} -f
+
+Inspect the rule files that were last pushed:
+
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "promrule-to-grafanarule-converter.fullname" . }} -- sh -c 'ls /tmp/rules && cat /tmp/rules/*.yml'
+
+{{- if .Values.sync.dryRun }}
+
+WARNING: sync.dryRun is enabled. The loop reports what would change with
+`mimirtool rules diff` and writes nothing to Grafana.
+{{- end }}
+{{- if and .Values.grafana.auth.token (not .Values.grafana.auth.existingSecret) }}
+
+WARNING: the Grafana token was supplied inline via grafana.auth.token. It is now
+stored in the Helm release secret in cluster. Fine for debugging, but for
+anything permanent switch to grafana.auth.existingSecret.
+{{- end }}
+{{- if .Values.grafana.tls.insecureSkipVerify }}
+
+WARNING: grafana.tls.insecureSkipVerify is enabled. The Grafana certificate is
+not verified.
+{{- end }}
+{{- if and .Values.rules.folder (not (contains "$m" .Values.rules.groupNameExpr)) }}
+
+WARNING: every rule shares the folder {{ .Values.rules.folder | quote }}, but
+rules.groupNameExpr does not include the source PrometheusRule. Two resources
+defining a group of the same name will overwrite each other in Grafana.
+{{- end }}
+{{- if .Values.sync.allowEmpty }}
+
+WARNING: sync.allowEmpty is enabled. If no PrometheusRule matches, every rule
+previously imported into Grafana will be deleted.
+{{- end }}
+{{- if gt (int (include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.interval)) 0 }}
+{{- if lt (int (include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.interval)) 10 }}
+
+WARNING: a sync interval below 10s puts noticeable load on the Kubernetes API
+server and on Grafana.
+{{- end }}
+{{- end }}

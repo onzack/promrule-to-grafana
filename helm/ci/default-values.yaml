@@ -1,0 +1,7 @@
+# Minimal values that make the chart render. Used by `helm lint` and `ct lint`,
+# which otherwise fail because a Grafana token is deliberately mandatory.
+grafana:
+  url: http://grafana.monitoring.svc.cluster.local:3000
+  datasourceUID: prometheus
+  auth:
+    token: ci-placeholder-token

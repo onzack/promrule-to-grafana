@@ -1,0 +1,263 @@
+# Default values for promrule-to-grafanarule-converter.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra labels/annotations added to every object rendered by this chart.
+commonLabels: {}
+commonAnnotations: {}
+
+# Base image. alpine/k8s already ships kubectl, yq, jq, curl and bash, so only
+# mimirtool has to be downloaded at runtime (the official grafana/mimirtool
+# image is distroless and therefore unusable as a base for a shell loop).
+# The tag tracks the bundled kubectl version.
+image:
+  repository: alpine/k8s
+  tag: "1.34.11"
+  # Takes precedence over tag when set, e.g. "sha256:abc...".
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# CLI tools used by the sync loop.
+#
+# For each tool the init container resolves, in order of precedence:
+#   1. url     - download exactly this URL
+#   2. version - build the canonical download URL for that version
+#   3. neither - use the binary from the base image, or download the latest
+#                release when the image does not provide it
+#
+# Pin a version here if a new upstream release breaks the sync.
+tools:
+  # Download kubectl and yq even when the base image already provides them.
+  forceDownload: false
+
+  mimirtool:
+    # Never present in the base image, so this is always downloaded.
+    # Example: "3.2.1" -> github.com/grafana/mimir/releases/download/mimir-3.2.1/mimirtool-linux-amd64
+    version: ""
+    url: ""
+
+  kubectl:
+    # Example: "1.34.1" -> dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+    version: ""
+    url: ""
+
+  yq:
+    # Example: "4.47.1" -> github.com/mikefarah/yq/releases/download/v4.47.1/yq_linux_amd64
+    version: ""
+    url: ""
+
+grafana:
+  # Base URL of the Grafana instance. "/api/convert/" is appended automatically.
+  url: "http://grafana-service.grafana.svc.cluster.local:3000"
+
+  # UID of the Prometheus data source the imported rules will query. Required.
+  datasourceUID: "prometheus"
+
+  # Must stay "1" when talking to Grafana rather than to a Mimir ruler.
+  tenantId: "1"
+
+  # Advanced: pin every imported rule to an already existing folder by UID, via
+  # the X-Grafana-Alerting-Folder-UID header.
+  #
+  # To simply collect all rules in one folder, use `rules.folder` further down
+  # instead: it addresses the folder by title and creates it if missing, whereas
+  # this requires a folder that already exists.
+  folderUID: ""
+
+  # Import the rules in a paused state, so nothing fires until you unpause them.
+  # Useful for a first roll-out against a production Grafana.
+  alertRulesPaused: false
+
+  # Additional headers passed to mimirtool as "name=value" strings.
+  extraHeaders: []
+
+  auth:
+    # Grafana service account token. Needs the "Alerting: Write" permission
+    # (alert.rules:write).
+    #
+    # Exactly one of `token` or `existingSecret` must be set.
+
+    # Inline token. Renders a Secret managed by this chart.
+    # DEBUGGING ONLY - the value ends up in the Helm release stored in the
+    # cluster and in your values file. Prefer `existingSecret` in production.
+    token: ""
+
+    # Name of an existing Secret holding the token, e.g. one produced by an
+    # ExternalSecret listed under `extraManifests`.
+    existingSecret: ""
+    existingSecretKey: "token"
+
+  tls:
+    # Skip verification of the Grafana certificate. Not recommended.
+    insecureSkipVerify: false
+    # Name of an existing Secret holding a CA bundle used to verify Grafana.
+    caSecret: ""
+    caSecretKey: "ca.crt"
+
+sync:
+  # How long to wait between two sync iterations.
+  interval: 30s
+
+  # Rules are only pushed when the rendered rule set changed. This forces a
+  # push at least this often, so that drift introduced directly in Grafana is
+  # repaired. Set to 0 to only ever push on change.
+  fullSyncInterval: 5m
+
+  # Abort an iteration that takes longer than this and retry on the next tick.
+  timeout: 5m
+
+  # Run `mimirtool rules diff` instead of `mimirtool rules sync`: report what
+  # would change without writing anything to Grafana.
+  dryRun: false
+
+  # Must stay 1. The Grafana API returns errors at mimirtool's default of 8.
+  concurrency: 1
+
+  # Safety valve: when no PrometheusRule matches, `mimirtool rules sync` would
+  # delete every previously imported rule from Grafana. By default such an
+  # iteration is skipped instead. Set to true to let empty mean "delete all".
+  allowEmpty: false
+
+  # Print every command as it runs (`set -x`).
+  debug: false
+
+  # Extra flags appended to the mimirtool sync/diff invocation.
+  extraArgs: []
+
+rules:
+  # Only consider PrometheusRules matching this label selector, e.g.
+  # "release=kube-prometheus-stack". Empty means all.
+  labelSelector: ""
+
+  # Regular expressions matched against the PrometheusRule namespace.
+  # `namespaces` empty means all namespaces; `excludeNamespaces` wins.
+  namespaces: []
+  excludeNamespaces: []
+
+  # A PrometheusRule carrying this annotation with the value "true" is skipped.
+  ignoreAnnotation: "promrule-to-grafanarule-converter/ignore"
+
+  # Single Grafana folder receiving every imported rule. The folder is created
+  # on first sync if it does not exist yet.
+  #
+  # Set this to "" to get one folder per PrometheusRule instead, named by
+  # `namespaceExpr` below.
+  folder: "Prometheus Synced Rules"
+
+  # yq expression producing the folder name, used only when `folder` is empty.
+  # `$m` is the PrometheusRule `.metadata`.
+  namespaceExpr: '$m.namespace + "-" + $m.name'
+
+  # yq expression producing the rule group name. `$m` is the PrometheusRule
+  # `.metadata` and `.name` is the group name as authored in the resource.
+  #
+  # A group name has to be unique within its folder, otherwise the rule groups
+  # overwrite each other in Grafana. Because everything shares one folder by
+  # default, the source namespace and resource name are prefixed: two
+  # PrometheusRules both defining a "general.rules" group are very common.
+  #
+  # If you switch to one folder per PrometheusRule, plain `.name` is enough and
+  # reads better in the Grafana UI.
+  groupNameExpr: '$m.namespace + "-" + $m.name + "-" + .name'
+
+serviceAccount:
+  create: true
+  # Defaults to the fullname of the release when empty.
+  name: ""
+  annotations: {}
+
+rbac:
+  # Creates the ClusterRole/ClusterRoleBinding granting read access to
+  # PrometheusRules in every namespace.
+  create: true
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+
+resources: {}
+  # requests:
+  #   cpu: 10m
+  #   memory: 64Mi
+  # limits:
+  #   memory: 256Mi
+
+initResources: {}
+  # requests:
+  #   cpu: 50m
+  #   memory: 64Mi
+  # limits:
+  #   memory: 256Mi
+
+# Restarts the pod when the sync loop stops iterating. It deliberately does not
+# fail on sync errors: a bad token or an unreachable Grafana is not fixed by a
+# restart and is easier to diagnose from the logs of a running pod.
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  failureThreshold: 3
+
+# Size limits for the emptyDir volumes holding the downloaded tools and the
+# rendered rule files. Empty means no limit.
+volumeSizeLimits:
+  tools: ""
+  tmp: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+terminationGracePeriodSeconds: 30
+hostAliases: []
+dnsPolicy: ""
+dnsConfig: {}
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+extraInitContainers: []
+extraContainers: []
+
+# Arbitrary manifests deployed alongside the chart. Entries may be maps or raw
+# strings and are rendered through `tpl`, so they can reference values and
+# builtin objects. Typical use: an ExternalSecret producing the Secret
+# referenced by `grafana.auth.existingSecret`.
+#
+# extraManifests:
+#   - apiVersion: external-secrets.io/v1
+#     kind: ExternalSecret
+#     metadata:
+#       name: '{{ include "promrule-to-grafanarule-converter.fullname" . }}-grafana-token'
+#     spec:
+#       secretStoreRef:
+#         name: vault
+#         kind: ClusterSecretStore
+#       target:
+#         name: grafana-rule-sync-token
+#       data:
+#         - secretKey: token
+#           remoteRef:
+#             key: grafana/rule-sync
+#             property: token
+extraManifests: []

@@ -1,0 +1,272 @@
+{{- include "promrule-to-grafanarule-converter.validate" . -}}
+{{- $interval := include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.interval -}}
+{{- $fullSync := include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.fullSyncInterval -}}
+{{- $timeout := include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.timeout -}}
+{{- $includeNs := ".*" -}}
+{{- if .Values.rules.namespaces -}}
+{{- $includeNs = printf "^(%s)$" (join "|" .Values.rules.namespaces) -}}
+{{- end -}}
+{{- $excludeNs := "^$" -}}
+{{- if .Values.rules.excludeNamespaces -}}
+{{- $excludeNs = printf "^(%s)$" (join "|" .Values.rules.excludeNamespaces) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Pinned to one: concurrent replicas would push conflicting rule sets to the
+  # same Grafana instance.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "promrule-to-grafanarule-converter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "promrule-to-grafanarule-converter.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+        {{- if and .Values.grafana.auth.token (not .Values.grafana.auth.existingSecret) }}
+        checksum/auth-secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with (merge (dict) .Values.podAnnotations .Values.commonAnnotations) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "promrule-to-grafanarule-converter.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: download-tools
+          image: {{ include "promrule-to-grafanarule-converter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /scripts/download-tools.sh
+          env:
+            - name: HOME
+              value: /tmp
+            - name: TOOLS_DIR
+              value: /tools
+            - name: DEBUG
+              value: {{ .Values.sync.debug | quote }}
+            - name: FORCE_DOWNLOAD
+              value: {{ .Values.tools.forceDownload | quote }}
+            - name: MIMIRTOOL_VERSION
+              value: {{ .Values.tools.mimirtool.version | quote }}
+            - name: MIMIRTOOL_URL
+              value: {{ .Values.tools.mimirtool.url | quote }}
+            - name: KUBECTL_VERSION
+              value: {{ .Values.tools.kubectl.version | quote }}
+            - name: KUBECTL_URL
+              value: {{ .Values.tools.kubectl.url | quote }}
+            - name: YQ_VERSION
+              value: {{ .Values.tools.yq.version | quote }}
+            - name: YQ_URL
+              value: {{ .Values.tools.yq.url | quote }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.initResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tools
+              mountPath: /tools
+            - name: tmp
+              mountPath: /tmp
+        {{- with .Values.extraInitContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: sync
+          image: {{ include "promrule-to-grafanarule-converter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /scripts/loop.sh
+          # The image sets WORKDIR /apps, which is not writable for a non-root
+          # user with a read-only root filesystem.
+          workingDir: /tmp
+          env:
+            - name: HOME
+              value: /tmp
+            - name: TOOLS_DIR
+              value: /tools
+            - name: RULES_DIR
+              value: /tmp/rules
+            - name: STATE_DIR
+              value: /tmp/state
+            - name: HEARTBEAT_FILE
+              value: /tmp/heartbeat
+            - name: DEBUG
+              value: {{ .Values.sync.debug | quote }}
+            - name: SYNC_INTERVAL_SECONDS
+              value: {{ $interval | quote }}
+            - name: SYNC_TIMEOUT_SECONDS
+              value: {{ $timeout | quote }}
+            - name: FULL_SYNC_INTERVAL_SECONDS
+              value: {{ $fullSync | quote }}
+            - name: HEARTBEAT_MAX_AGE_SECONDS
+              value: {{ include "promrule-to-grafanarule-converter.heartbeatMaxAge" . | quote }}
+            - name: SYNC_CONCURRENCY
+              value: {{ .Values.sync.concurrency | quote }}
+            - name: DRY_RUN
+              value: {{ .Values.sync.dryRun | quote }}
+            - name: ALLOW_EMPTY
+              value: {{ .Values.sync.allowEmpty | quote }}
+            - name: MIMIRTOOL_EXTRA_ARGS
+              value: {{ join " " .Values.sync.extraArgs | quote }}
+            # Rule selection
+            - name: RULE_LABEL_SELECTOR
+              value: {{ .Values.rules.labelSelector | quote }}
+            - name: INCLUDE_NAMESPACES_REGEX
+              value: {{ $includeNs | quote }}
+            - name: EXCLUDE_NAMESPACES_REGEX
+              value: {{ $excludeNs | quote }}
+            - name: IGNORE_ANNOTATION
+              value: {{ .Values.rules.ignoreAnnotation | quote }}
+            # Read by the transform via strenv() so that quotes and apostrophes
+            # in a folder title cannot break the embedded yq program.
+            - name: RULES_FOLDER
+              value: {{ .Values.rules.folder | quote }}
+            # mimirtool talks to the Grafana rule conversion endpoint, not to a
+            # Mimir ruler, which is why the tenant id is always 1.
+            - name: MIMIR_ADDRESS
+              value: {{ include "promrule-to-grafanarule-converter.mimirAddress" . | quote }}
+            - name: MIMIR_TENANT_ID
+              value: {{ .Values.grafana.tenantId | quote }}
+            - name: MIMIR_EXTRA_HEADERS
+              value: {{ include "promrule-to-grafanarule-converter.extraHeaders" . | quote }}
+            - name: MIMIR_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "promrule-to-grafanarule-converter.authSecretName" . }}
+                  key: {{ include "promrule-to-grafanarule-converter.authSecretKey" . }}
+            - name: GRAFANA_TLS_SKIP_VERIFY
+              value: {{ .Values.grafana.tls.insecureSkipVerify | quote }}
+            {{- if .Values.grafana.tls.caSecret }}
+            - name: GRAFANA_TLS_CA_PATH
+              value: /etc/grafana-ca/{{ .Values.grafana.tls.caSecretKey }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            exec:
+              command:
+                - /scripts/healthcheck.sh
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tools
+              mountPath: /tools
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.grafana.tls.caSecret }}
+            - name: grafana-ca
+              mountPath: /etc/grafana-ca
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "promrule-to-grafanarule-converter.fullname" . }}-scripts
+            defaultMode: 0555
+        - name: tools
+          emptyDir:
+            {{- with .Values.volumeSizeLimits.tools }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        - name: tmp
+          emptyDir:
+            {{- with .Values.volumeSizeLimits.tmp }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        {{- if .Values.grafana.tls.caSecret }}
+        - name: grafana-ca
+          secret:
+            secretName: {{ .Values.grafana.tls.caSecret }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
