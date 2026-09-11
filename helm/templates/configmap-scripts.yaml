@@ -16,10 +16,10 @@ inlined, which is why they are documented as trusted input.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}-scripts
+  name: {{ include "promrule-to-grafana.fullname" . }}-scripts
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+    {{- include "promrule-to-grafana.labels" . | nindent 4 }}
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -334,7 +334,7 @@ data:
     terminate=0
     trap 'terminate=1' TERM INT
 
-    echo "promrule-to-grafanarule-converter starting: interval ${SYNC_INTERVAL_SECONDS}s, timeout ${SYNC_TIMEOUT_SECONDS}s"
+    echo "promrule-to-grafana starting: interval ${SYNC_INTERVAL_SECONDS}s, timeout ${SYNC_TIMEOUT_SECONDS}s"
 
     while [ "${terminate}" -eq 0 ]; do
       if timeout "${SYNC_TIMEOUT_SECONDS}" "${script_dir}/sync-once.sh"; then
@@ -365,7 +365,7 @@ data:
       wait "$!" 2>/dev/null || true
     done
 
-    echo "promrule-to-grafanarule-converter stopped"
+    echo "promrule-to-grafana stopped"
 
   healthcheck.sh: |
     #!/bin/sh
@@ -387,3 +387,97 @@ data:
     fi
 
     echo "ok, last iteration finished ${age}s ago"
+
+  cleanup.sh: |
+    #!/bin/sh
+    # Pre-delete hook: stop the sync loop, then delete the Grafana folders
+    # (mimirtool namespaces) this release imported. Only the conversion
+    # endpoint is used, so Grafana UI rules are never touched.
+    set -eu
+    if [ "${DEBUG:-false}" = "true" ]; then
+      set -x
+    fi
+
+    : "${TOOLS_DIR:=/tools}"
+    : "${STATE_DIR:=/tmp/state}"
+    : "${SCALE_WAIT_SECONDS:=90}"
+
+    PATH="${TOOLS_DIR}:${PATH}"
+    export PATH
+
+    mkdir -p "${STATE_DIR}"
+
+    scale_down_sync() {
+      if [ -z "${DEPLOYMENT_NAME:-}" ]; then
+        echo "DEPLOYMENT_NAME is unset; not scaling anything down" >&2
+        return 0
+      fi
+      if ! kubectl get "deployment/${DEPLOYMENT_NAME}" >/dev/null 2>&1; then
+        echo "sync Deployment ${DEPLOYMENT_NAME} is already gone"
+        return 0
+      fi
+      echo "scaling Deployment ${DEPLOYMENT_NAME} to 0 so the loop cannot recreate rules"
+      kubectl scale "deployment/${DEPLOYMENT_NAME}" --replicas=0
+      echo "waiting for the sync Deployment to finish scaling down"
+      kubectl rollout status "deployment/${DEPLOYMENT_NAME}" --timeout="${SCALE_WAIT_SECONDS}s"
+    }
+
+    delete_namespace() {
+      _ns="$1"
+      echo "deleting Grafana-managed rules in folder ${_ns}"
+      set -- rules delete-namespace
+      if [ "${GRAFANA_TLS_SKIP_VERIFY:-false}" = "true" ]; then
+        set -- "$@" --tls-skip-verify
+      fi
+      if [ -n "${GRAFANA_TLS_CA_PATH:-}" ]; then
+        set -- "$@" "--tls-ca-path=${GRAFANA_TLS_CA_PATH}"
+      fi
+      if [ -n "${MIMIRTOOL_EXTRA_ARGS:-}" ]; then
+        # Intentionally word split so that sync.extraArgs can add several flags.
+        # shellcheck disable=SC2086
+        set -- "$@" ${MIMIRTOOL_EXTRA_ARGS}
+      fi
+      set -- "$@" "${_ns}"
+      mimirtool "$@"
+    }
+
+    ns_file="${STATE_DIR}/cleanup-namespaces"
+    : > "${ns_file}"
+
+    if [ -n "${RULES_FOLDER:-}" ]; then
+      printf '%s\n' "${RULES_FOLDER}" >> "${ns_file}"
+    else
+      raw_file="${STATE_DIR}/prometheusrules.json"
+      set -- prometheusrules.monitoring.coreos.com --all-namespaces --output=json
+      if [ -n "${RULE_LABEL_SELECTOR:-}" ]; then
+        set -- "$@" "--selector=${RULE_LABEL_SELECTOR}"
+      fi
+      kubectl get "$@" > "${raw_file}"
+      yq --input-format=json -r '
+        .items[]
+        | .metadata as $m
+        | select($m.namespace | test(strenv(INCLUDE_NAMESPACES_REGEX)))
+        | select($m.namespace | test(strenv(EXCLUDE_NAMESPACES_REGEX)) | not)
+        | select(
+            ($m.annotations // {})
+            | to_entries
+            | any_c(.key == strenv(IGNORE_ANNOTATION) and .value == "true")
+            | not
+          )
+        | ({{ $namespaceExpr }})
+      ' "${raw_file}" >> "${ns_file}"
+    fi
+
+    if [ -n "${CLEANUP_EXTRA_NAMESPACES:-}" ]; then
+      printf '%s\n' "${CLEANUP_EXTRA_NAMESPACES}" >> "${ns_file}"
+    fi
+
+    scale_down_sync
+
+    # Unique, non-empty folder titles. sort -u keeps names with spaces intact.
+    sort -u "${ns_file}" | while IFS= read -r ns; do
+      [ -n "${ns}" ] || continue
+      delete_namespace "${ns}"
+    done
+
+    echo "grafana-managed alert cleanup finished"

@@ -1,4 +1,4 @@
-# promrule-to-grafanarule-converter
+# promrule-to-grafana
 
 Mirrors `PrometheusRule` **alerting** rules from every namespace of a cluster into a
 Grafana instance as Grafana-managed alert rules.
@@ -79,7 +79,7 @@ demand, so it is usually what you want.
 ## Install
 
 ```console
-helm install rule-sync ./charts/promrule-to-grafanarule-converter \
+helm install rule-sync ./charts/promrule-to-grafana \
   --namespace monitoring \
   --set grafana.url=https://grafana.example.com \
   --set grafana.datasourceUID=PBFA97CFB590B2093 \
@@ -88,6 +88,34 @@ helm install rule-sync ./charts/promrule-to-grafanarule-converter \
 
 The chart refuses to render without a token, rather than deploying something
 that would return 401 forever.
+
+## Uninstall
+
+`helm uninstall` runs a pre-delete Job that:
+
+1. scales the sync Deployment to zero, so the loop cannot push the rules back,
+2. deletes every Grafana folder this release wrote to, via
+   `mimirtool rules delete-namespace` against `/api/convert/`.
+
+With the default `rules.folder`, that is the single folder
+`Prometheus Synced Rules`. When `rules.folder` is empty, the Job lists the
+current `PrometheusRules` and deletes each derived folder. Extra titles can
+be listed under `cleanup.extraNamespaces`.
+
+Only rules imported through `/api/convert/` are deleted. Alert rules created
+in the Grafana UI are left alone. Empty Grafana folders may remain after the
+rule groups are gone.
+
+```yaml
+cleanup:
+  enabled: true
+  timeout: 10m
+  extraNamespaces: []
+```
+
+If Grafana is already gone, the Job cannot finish and uninstall waits until
+the Helm timeout. Skip it with `--no-hooks`, or set `cleanup.enabled=false`
+and upgrade once before uninstalling.
 
 ## Grafana token
 
@@ -112,7 +140,7 @@ extraManifests:
   - apiVersion: external-secrets.io/v1
     kind: ExternalSecret
     metadata:
-      name: '{{ include "promrule-to-grafanarule-converter.fullname" . }}-grafana-token'
+      name: '{{ include "promrule-to-grafana.fullname" . }}-grafana-token'
     spec:
       refreshInterval: 1h
       secretStoreRef:
@@ -209,7 +237,7 @@ namespace. Exclusion wins over inclusion.
 A single resource can opt out without touching the chart:
 
 ```console
-kubectl annotate prometheusrule noisy-rules promrule-to-grafanarule-converter/ignore=true
+kubectl annotate prometheusrule noisy-rules promrule-to-grafana/ignore=true
 ```
 
 Recording rules are always dropped. A rule is treated as alerting only if it has
@@ -289,7 +317,7 @@ List what is actually under this chart's control and compare:
 mimirtool rules list --address=https://grafana.example.com/api/convert/ --id=1 --key="$TOKEN"
 
 # what the loop last rendered, i.e. what it will converge Grafana on
-kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafanarule-converter \
+kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafana \
   -- sh -c 'cat /tmp/rules/*.yml'
 ```
 
@@ -307,14 +335,14 @@ before doing the cleanup, otherwise it will simply push the leftovers back.
 
 ```console
 # follow the loop
-kubectl logs -n monitoring -l app.kubernetes.io/name=promrule-to-grafanarule-converter -f
+kubectl logs -n monitoring -l app.kubernetes.io/name=promrule-to-grafana -f
 
 # inspect the rule files that were last pushed
-kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafanarule-converter \
+kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafana \
   -- sh -c 'cat /tmp/rules/*.yml'
 
 # see the raw PrometheusRule list the last iteration read
-kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafanarule-converter \
+kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafana \
   -- cat /tmp/state/prometheusrules.json
 ```
 
@@ -344,6 +372,9 @@ to Grafana errors, which are easier to read from a pod that stays up.
 | `rules.folder` | `Prometheus Synced Rules` | Single folder for every rule; `""` means one folder per resource |
 | `rules.namespaceExpr` | `$m.namespace + "-" + $m.name` | Folder name expression, used only when `rules.folder` is empty |
 | `rules.groupNameExpr` | `$m.namespace + "-" + $m.name + "-" + .name` | Rule group name; must be unique within a folder |
+| `cleanup.enabled` | `true` | Delete imported Grafana-managed alerts on uninstall |
+| `cleanup.timeout` | `10m` | Deadline for the pre-delete cleanup Job |
+| `cleanup.extraNamespaces` | `[]` | Extra Grafana folder titles to delete on uninstall |
 | `extraManifests` | `[]` | Extra objects deployed with the release, rendered via `tpl` |
 
 See [values.yaml](values.yaml) for the full set.
@@ -352,4 +383,8 @@ See [values.yaml](values.yaml) for the full set.
 
 The chart creates a ClusterRole with `get` and `list` on
 `prometheusrules.monitoring.coreos.com` and binds it to the ServiceAccount.
-Access is read-only; nothing is ever written back to the cluster.
+That access is read-only; PrometheusRules are never written back.
+
+When `cleanup.enabled` is true, a namespaced Role also allows the ServiceAccount
+to scale the sync Deployment to zero, which the pre-delete Job needs so the
+loop is stopped before Grafana rules are removed.

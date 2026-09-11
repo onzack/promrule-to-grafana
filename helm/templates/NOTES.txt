@@ -1,10 +1,10 @@
-{{ .Chart.Name }} {{ .Chart.Version }} is installed as {{ include "promrule-to-grafanarule-converter.fullname" . }}.
+{{ .Chart.Name }} {{ .Chart.Version }} is installed as {{ include "promrule-to-grafana.fullname" . }}.
 
 PrometheusRule alerting rules are mirrored into Grafana every {{ .Values.sync.interval }}.
 
-  Target:      {{ include "promrule-to-grafanarule-converter.mimirAddress" . }}
+  Target:      {{ include "promrule-to-grafana.mimirAddress" . }}
   Data source: {{ .Values.grafana.datasourceUID }}
-  Folders:     {{ include "promrule-to-grafanarule-converter.folderDescription" . }}
+  Folders:     {{ include "promrule-to-grafana.folderDescription" . }}
   Namespaces:  {{ if .Values.rules.namespaces }}{{ join ", " .Values.rules.namespaces }}{{ else }}all{{ end }}
   {{- if .Values.rules.excludeNamespaces }}
   Excluded:    {{ join ", " .Values.rules.excludeNamespaces }}
@@ -15,11 +15,18 @@ PrometheusRule alerting rules are mirrored into Grafana every {{ .Values.sync.in
 
 Follow the sync loop:
 
-  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "promrule-to-grafanarule-converter.name" . }} -f
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "promrule-to-grafana.name" . }} -f
 
 Inspect the rule files that were last pushed:
 
-  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "promrule-to-grafanarule-converter.fullname" . }} -- sh -c 'ls /tmp/rules && cat /tmp/rules/*.yml'
+  kubectl exec -n {{ .Release.Namespace }} deploy/{{ include "promrule-to-grafana.fullname" . }} -- sh -c 'ls /tmp/rules && cat /tmp/rules/*.yml'
+{{- if .Values.cleanup.enabled }}
+
+Uninstall deletes the Grafana-managed alert rules this release imported
+(folders: {{ include "promrule-to-grafana.folderDescription" . }}).
+If Grafana is already unreachable, uninstall with --no-hooks, or set
+cleanup.enabled=false before removing the release.
+{{- end }}
 
 {{- if .Values.sync.dryRun }}
 
@@ -48,8 +55,8 @@ defining a group of the same name will overwrite each other in Grafana.
 WARNING: sync.allowEmpty is enabled. If no PrometheusRule matches, every rule
 previously imported into Grafana will be deleted.
 {{- end }}
-{{- if gt (int (include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.interval)) 0 }}
-{{- if lt (int (include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.interval)) 10 }}
+{{- if gt (int (include "promrule-to-grafana.toSeconds" .Values.sync.interval)) 0 }}
+{{- if lt (int (include "promrule-to-grafana.toSeconds" .Values.sync.interval)) 10 }}
 
 WARNING: a sync interval below 10s puts noticeable load on the Kubernetes API
 server and on Grafana.

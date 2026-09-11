@@ -1,4 +1,4 @@
-# Default values for promrule-to-grafanarule-converter.
+# Default values for promrule-to-grafana.
 
 nameOverride: ""
 fullnameOverride: ""
@@ -138,7 +138,7 @@ rules:
   excludeNamespaces: []
 
   # A PrometheusRule carrying this annotation with the value "true" is skipped.
-  ignoreAnnotation: "promrule-to-grafanarule-converter/ignore"
+  ignoreAnnotation: "promrule-to-grafana/ignore"
 
   # Single Grafana folder receiving every imported rule. The folder is created
   # on first sync if it does not exist yet.
@@ -162,6 +162,22 @@ rules:
   # If you switch to one folder per PrometheusRule, plain `.name` is enough and
   # reads better in the Grafana UI.
   groupNameExpr: '$m.namespace + "-" + $m.name + "-" + .name'
+
+# Removes the Grafana-managed alert rules this release imported when the
+# chart is uninstalled. A pre-delete Job scales the sync Deployment to
+# zero first, so the loop cannot recreate the rules, then deletes each
+# Grafana folder (mimirtool namespace) this chart wrote to.
+#
+# Disable this, or pass `--no-hooks` to `helm uninstall`, when Grafana is
+# already gone: a failing Job blocks uninstall until the Helm timeout.
+cleanup:
+  enabled: true
+  # Deadline for the whole Job, including downloading mimirtool and
+  # waiting for the sync pod to terminate.
+  timeout: 10m
+  # Extra folder titles to delete, in addition to `rules.folder` or the
+  # folders derived from current PrometheusRules via `rules.namespaceExpr`.
+  extraNamespaces: []
 
 serviceAccount:
   create: true
@@ -248,7 +264,7 @@ extraContainers: []
 #   - apiVersion: external-secrets.io/v1
 #     kind: ExternalSecret
 #     metadata:
-#       name: '{{ include "promrule-to-grafanarule-converter.fullname" . }}-grafana-token'
+#       name: '{{ include "promrule-to-grafana.fullname" . }}-grafana-token'
 #     spec:
 #       secretStoreRef:
 #         name: vault

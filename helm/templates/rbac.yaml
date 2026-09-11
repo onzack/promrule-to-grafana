@@ -2,9 +2,9 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+  name: {{ include "promrule-to-grafana.fullname" . }}
   labels:
-    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+    {{- include "promrule-to-grafana.labels" . | nindent 4 }}
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -23,9 +23,9 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+  name: {{ include "promrule-to-grafana.fullname" . }}
   labels:
-    {{- include "promrule-to-grafanarule-converter.labels" . | nindent 4 }}
+    {{- include "promrule-to-grafana.labels" . | nindent 4 }}
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -33,9 +33,66 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "promrule-to-grafanarule-converter.fullname" . }}
+  name: {{ include "promrule-to-grafana.fullname" . }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "promrule-to-grafanarule-converter.serviceAccountName" . }}
+    name: {{ include "promrule-to-grafana.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.cleanup.enabled }}
+---
+# Namespaced write access used only by the pre-delete cleanup Job, to stop
+# the sync Deployment before Grafana rules are removed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "promrule-to-grafana.fullname" . }}-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "promrule-to-grafana.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  # kubectl rollout status uses a watch informer. list/watch cannot be
+  # narrowed with resourceNames, so these stay namespace-scoped only.
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - deployments/scale
+    resourceNames:
+      - {{ include "promrule-to-grafana.fullname" . }}
+    verbs:
+      - get
+      - patch
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "promrule-to-grafana.fullname" . }}-cleanup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "promrule-to-grafana.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "promrule-to-grafana.fullname" . }}-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "promrule-to-grafana.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

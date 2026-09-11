@@ -1,10 +1,10 @@
 {{/* Chart name, overridable. */}}
-{{- define "promrule-to-grafanarule-converter.name" -}}
+{{- define "promrule-to-grafana.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/* Fully qualified release name. */}}
-{{- define "promrule-to-grafanarule-converter.fullname" -}}
+{{- define "promrule-to-grafana.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
@@ -17,18 +17,18 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "promrule-to-grafanarule-converter.chart" -}}
+{{- define "promrule-to-grafana.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "promrule-to-grafanarule-converter.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "promrule-to-grafanarule-converter.name" . }}
+{{- define "promrule-to-grafana.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "promrule-to-grafana.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
-{{- define "promrule-to-grafanarule-converter.labels" -}}
-helm.sh/chart: {{ include "promrule-to-grafanarule-converter.chart" . }}
-{{ include "promrule-to-grafanarule-converter.selectorLabels" . }}
+{{- define "promrule-to-grafana.labels" -}}
+helm.sh/chart: {{ include "promrule-to-grafana.chart" . }}
+{{ include "promrule-to-grafana.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -38,15 +38,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 {{- end -}}
 
-{{- define "promrule-to-grafanarule-converter.serviceAccountName" -}}
+{{- define "promrule-to-grafana.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
-{{- default (include "promrule-to-grafanarule-converter.fullname" .) .Values.serviceAccount.name -}}
+{{- default (include "promrule-to-grafana.fullname" .) .Values.serviceAccount.name -}}
 {{- else -}}
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "promrule-to-grafanarule-converter.image" -}}
+{{- define "promrule-to-grafana.image" -}}
 {{- if .Values.image.digest -}}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
 {{- else -}}
@@ -58,7 +58,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 Converts a duration such as "30s", "5m", "2h" or a bare number of seconds into
 seconds, so that the sync loop can do plain integer arithmetic.
 */}}
-{{- define "promrule-to-grafanarule-converter.toSeconds" -}}
+{{- define "promrule-to-grafana.toSeconds" -}}
 {{- $d := . | toString | trim -}}
 {{- if regexMatch "^[0-9]+$" $d -}}
 {{- $d -}}
@@ -69,25 +69,25 @@ seconds, so that the sync loop can do plain integer arithmetic.
 {{- else if regexMatch "^[0-9]+h$" $d -}}
 {{- mul (trimSuffix "h" $d | int) 3600 -}}
 {{- else -}}
-{{- fail (printf "promrule-to-grafanarule-converter: cannot parse duration %q. Use a plain number of seconds or a value like 30s, 5m, 2h." $d) -}}
+{{- fail (printf "promrule-to-grafana: cannot parse duration %q. Use a plain number of seconds or a value like 30s, 5m, 2h." $d) -}}
 {{- end -}}
 {{- end -}}
 
 {{/* Address mimirtool talks to: the Grafana rule conversion endpoint. */}}
-{{- define "promrule-to-grafanarule-converter.mimirAddress" -}}
+{{- define "promrule-to-grafana.mimirAddress" -}}
 {{- printf "%s/api/convert/" (.Values.grafana.url | trimSuffix "/") -}}
 {{- end -}}
 
 {{/* Name of the Secret holding the Grafana token. */}}
-{{- define "promrule-to-grafanarule-converter.authSecretName" -}}
+{{- define "promrule-to-grafana.authSecretName" -}}
 {{- if .Values.grafana.auth.existingSecret -}}
 {{- .Values.grafana.auth.existingSecret -}}
 {{- else -}}
-{{- printf "%s-grafana-auth" (include "promrule-to-grafanarule-converter.fullname" .) -}}
+{{- printf "%s-grafana-auth" (include "promrule-to-grafana.fullname" .) -}}
 {{- end -}}
 {{- end -}}
 
-{{- define "promrule-to-grafanarule-converter.authSecretKey" -}}
+{{- define "promrule-to-grafana.authSecretKey" -}}
 {{- if .Values.grafana.auth.existingSecret -}}
 {{- .Values.grafana.auth.existingSecretKey | default "token" -}}
 {{- else -}}
@@ -99,7 +99,7 @@ seconds, so that the sync loop can do plain integer arithmetic.
 Headers mimirtool sends to Grafana, newline separated as MIMIR_EXTRA_HEADERS
 expects. X-Grafana-Alerting-Datasource-UID is required by the POST endpoints.
 */}}
-{{- define "promrule-to-grafanarule-converter.extraHeaders" -}}
+{{- define "promrule-to-grafana.extraHeaders" -}}
 {{- $headers := list (printf "X-Grafana-Alerting-Datasource-UID=%s" .Values.grafana.datasourceUID) -}}
 {{- with .Values.grafana.folderUID -}}
 {{- $headers = append $headers (printf "X-Grafana-Alerting-Folder-UID=%s" .) -}}
@@ -118,9 +118,9 @@ Age after which the liveness probe considers the loop stuck. An iteration can
 legitimately take up to sync.timeout, and the heartbeat is written after it, so
 the threshold has to clear timeout plus a couple of intervals.
 */}}
-{{- define "promrule-to-grafanarule-converter.heartbeatMaxAge" -}}
-{{- $interval := include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.interval | int -}}
-{{- $timeout := include "promrule-to-grafanarule-converter.toSeconds" .Values.sync.timeout | int -}}
+{{- define "promrule-to-grafana.heartbeatMaxAge" -}}
+{{- $interval := include "promrule-to-grafana.toSeconds" .Values.sync.interval | int -}}
+{{- $timeout := include "promrule-to-grafana.toSeconds" .Values.sync.timeout | int -}}
 {{- add $timeout (mul $interval 2) -}}
 {{- end -}}
 
@@ -128,42 +128,48 @@ the threshold has to clear timeout plus a couple of intervals.
 Configuration errors that would otherwise surface as a pod that silently does
 nothing or 401s forever.
 */}}
-{{- define "promrule-to-grafanarule-converter.validate" -}}
+{{- define "promrule-to-grafana.validate" -}}
 {{- $auth := .Values.grafana.auth -}}
 {{- if and $auth.token $auth.existingSecret -}}
-{{- fail "promrule-to-grafanarule-converter: set either grafana.auth.token or grafana.auth.existingSecret, not both." -}}
+{{- fail "promrule-to-grafana: set either grafana.auth.token or grafana.auth.existingSecret, not both." -}}
 {{- end -}}
 {{- if not (or $auth.token $auth.existingSecret) -}}
-{{- fail "promrule-to-grafanarule-converter: a Grafana service account token is required. Set grafana.auth.existingSecret to the name of a Secret holding it, or grafana.auth.token for a quick debugging run." -}}
+{{- fail "promrule-to-grafana: a Grafana service account token is required. Set grafana.auth.existingSecret to the name of a Secret holding it, or grafana.auth.token for a quick debugging run." -}}
 {{- end -}}
 {{- if not .Values.grafana.url -}}
-{{- fail "promrule-to-grafanarule-converter: grafana.url is required." -}}
+{{- fail "promrule-to-grafana: grafana.url is required." -}}
 {{- end -}}
 {{- if not (regexMatch "^https?://" (.Values.grafana.url | toString)) -}}
-{{- fail (printf "promrule-to-grafanarule-converter: grafana.url must start with http:// or https://, got %q." (.Values.grafana.url | toString)) -}}
+{{- fail (printf "promrule-to-grafana: grafana.url must start with http:// or https://, got %q." (.Values.grafana.url | toString)) -}}
 {{- end -}}
 {{- if not .Values.grafana.datasourceUID -}}
-{{- fail "promrule-to-grafanarule-converter: grafana.datasourceUID is required. It is sent as the X-Grafana-Alerting-Datasource-UID header and tells Grafana which data source the imported rules query." -}}
+{{- fail "promrule-to-grafana: grafana.datasourceUID is required. It is sent as the X-Grafana-Alerting-Datasource-UID header and tells Grafana which data source the imported rules query." -}}
 {{- end -}}
 {{/* Coerced, because --set grafana.tenantId=2 yields an int rather than a string. */}}
 {{- if ne (.Values.grafana.tenantId | toString) "1" -}}
-{{- fail (printf "promrule-to-grafanarule-converter: grafana.tenantId must be \"1\" when targeting Grafana rather than a Mimir ruler, got %q." (.Values.grafana.tenantId | toString)) -}}
+{{- fail (printf "promrule-to-grafana: grafana.tenantId must be \"1\" when targeting Grafana rather than a Mimir ruler, got %q." (.Values.grafana.tenantId | toString)) -}}
 {{- end -}}
 {{- if .Values.grafana.tls.caSecret -}}
 {{- if not .Values.grafana.tls.caSecretKey -}}
-{{- fail "promrule-to-grafanarule-converter: grafana.tls.caSecretKey is required when grafana.tls.caSecret is set." -}}
+{{- fail "promrule-to-grafana: grafana.tls.caSecretKey is required when grafana.tls.caSecret is set." -}}
 {{- end -}}
 {{- end -}}
 {{- if not (or .Values.rules.folder .Values.rules.namespaceExpr) -}}
-{{- fail "promrule-to-grafanarule-converter: set rules.folder to collect every rule in one Grafana folder, or rules.namespaceExpr to derive a folder name per PrometheusRule." -}}
+{{- fail "promrule-to-grafana: set rules.folder to collect every rule in one Grafana folder, or rules.namespaceExpr to derive a folder name per PrometheusRule." -}}
 {{- end -}}
 {{- if not .Values.rules.groupNameExpr -}}
-{{- fail "promrule-to-grafanarule-converter: rules.groupNameExpr must not be empty." -}}
+{{- fail "promrule-to-grafana: rules.groupNameExpr must not be empty." -}}
 {{- end -}}
 {{- end -}}
 
+{{- define "promrule-to-grafana.hookAnnotations" -}}
+helm.sh/hook: pre-delete
+helm.sh/hook-weight: "0"
+helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+{{- end -}}
+
 {{/* Human readable description of where rules end up, for NOTES.txt. */}}
-{{- define "promrule-to-grafanarule-converter.folderDescription" -}}
+{{- define "promrule-to-grafana.folderDescription" -}}
 {{- if .Values.rules.folder -}}
 {{- printf "one folder, %q" .Values.rules.folder -}}
 {{- else -}}

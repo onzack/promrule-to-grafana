@@ -1,7 +1,4 @@
-{{- include "promrule-to-grafana.validate" . -}}
-{{- $interval := include "promrule-to-grafana.toSeconds" .Values.sync.interval -}}
-{{- $fullSync := include "promrule-to-grafana.toSeconds" .Values.sync.fullSyncInterval -}}
-{{- $timeout := include "promrule-to-grafana.toSeconds" .Values.sync.timeout -}}
+{{- if .Values.cleanup.enabled }}
 {{- $includeNs := ".*" -}}
 {{- if .Values.rules.namespaces -}}
 {{- $includeNs = printf "^(%s)$" (join "|" .Values.rules.namespaces) -}}
@@ -10,43 +7,39 @@
 {{- if .Values.rules.excludeNamespaces -}}
 {{- $excludeNs = printf "^(%s)$" (join "|" .Values.rules.excludeNamespaces) -}}
 {{- end -}}
-apiVersion: apps/v1
-kind: Deployment
+{{- $timeout := include "promrule-to-grafana.toSeconds" .Values.cleanup.timeout | int -}}
+{{- $scaleWait := add (.Values.terminationGracePeriodSeconds | int) 30 -}}
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: {{ include "promrule-to-grafana.fullname" . }}
+  name: {{ printf "%s-cleanup" (include "promrule-to-grafana.fullname" .) | trunc 63 | trimSuffix "-" }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "promrule-to-grafana.labels" . | nindent 4 }}
-  {{- with .Values.commonAnnotations }}
+    app.kubernetes.io/component: cleanup
   annotations:
+    {{- include "promrule-to-grafana.hookAnnotations" . | nindent 4 }}
+    {{- with .Values.commonAnnotations }}
     {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
-  # Pinned to one: concurrent replicas would push conflicting rule sets to the
-  # same Grafana instance.
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      {{- include "promrule-to-grafana.selectorLabels" . | nindent 6 }}
+  backoffLimit: 2
+  activeDeadlineSeconds: {{ $timeout }}
+  ttlSecondsAfterFinished: 600
   template:
     metadata:
       labels:
         {{- include "promrule-to-grafana.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: sync
+        app.kubernetes.io/component: cleanup
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- with (merge (dict) .Values.podAnnotations .Values.commonAnnotations) }}
       annotations:
-        checksum/scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
-        {{- if and .Values.grafana.auth.token (not .Values.grafana.auth.existingSecret) }}
-        checksum/auth-secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
-        {{- end }}
-        {{- with (merge (dict) .Values.podAnnotations .Values.commonAnnotations) }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
+      {{- end }}
     spec:
+      restartPolicy: OnFailure
       serviceAccountName: {{ include "promrule-to-grafana.serviceAccountName" . }}
       automountServiceAccountToken: true
       {{- with .Values.imagePullSecrets }}
@@ -82,10 +75,6 @@ spec:
       {{- end }}
       {{- with .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.topologySpreadConstraints }}
-      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       initContainers:
@@ -131,48 +120,28 @@ spec:
               mountPath: /tools
             - name: tmp
               mountPath: /tmp
-        {{- with .Values.extraInitContainers }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
       containers:
-        - name: sync
+        - name: cleanup
           image: {{ include "promrule-to-grafana.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
-            - /scripts/loop.sh
-          # The image sets WORKDIR /apps, which is not writable for a non-root
-          # user with a read-only root filesystem.
+            - /scripts/cleanup.sh
           workingDir: /tmp
           env:
             - name: HOME
               value: /tmp
             - name: TOOLS_DIR
               value: /tools
-            - name: RULES_DIR
-              value: /tmp/rules
             - name: STATE_DIR
               value: /tmp/state
-            - name: HEARTBEAT_FILE
-              value: /tmp/heartbeat
             - name: DEBUG
               value: {{ .Values.sync.debug | quote }}
-            - name: SYNC_INTERVAL_SECONDS
-              value: {{ $interval | quote }}
-            - name: SYNC_TIMEOUT_SECONDS
-              value: {{ $timeout | quote }}
-            - name: FULL_SYNC_INTERVAL_SECONDS
-              value: {{ $fullSync | quote }}
-            - name: HEARTBEAT_MAX_AGE_SECONDS
-              value: {{ include "promrule-to-grafana.heartbeatMaxAge" . | quote }}
-            - name: SYNC_CONCURRENCY
-              value: {{ .Values.sync.concurrency | quote }}
-            - name: DRY_RUN
-              value: {{ .Values.sync.dryRun | quote }}
-            - name: ALLOW_EMPTY
-              value: {{ .Values.sync.allowEmpty | quote }}
+            - name: DEPLOYMENT_NAME
+              value: {{ include "promrule-to-grafana.fullname" . | quote }}
+            - name: SCALE_WAIT_SECONDS
+              value: {{ $scaleWait | quote }}
             - name: MIMIRTOOL_EXTRA_ARGS
               value: {{ join " " .Values.sync.extraArgs | quote }}
-            # Rule selection
             - name: RULE_LABEL_SELECTOR
               value: {{ .Values.rules.labelSelector | quote }}
             - name: INCLUDE_NAMESPACES_REGEX
@@ -181,12 +150,10 @@ spec:
               value: {{ $excludeNs | quote }}
             - name: IGNORE_ANNOTATION
               value: {{ .Values.rules.ignoreAnnotation | quote }}
-            # Read by the transform via strenv() so that quotes and apostrophes
-            # in a folder title cannot break the embedded yq program.
             - name: RULES_FOLDER
               value: {{ .Values.rules.folder | quote }}
-            # mimirtool talks to the Grafana rule conversion endpoint, not to a
-            # Mimir ruler, which is why the tenant id is always 1.
+            - name: CLEANUP_EXTRA_NAMESPACES
+              value: {{ join "\n" .Values.cleanup.extraNamespaces | quote }}
             - name: MIMIR_ADDRESS
               value: {{ include "promrule-to-grafana.mimirAddress" . | quote }}
             - name: MIMIR_TENANT_ID
@@ -210,15 +177,6 @@ spec:
           {{- with .Values.extraEnvFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- if .Values.livenessProbe.enabled }}
-          livenessProbe:
-            exec:
-              command:
-                - /scripts/healthcheck.sh
-            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
-            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
-            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
           {{- end }}
           {{- with .Values.securityContext }}
           securityContext:
@@ -245,9 +203,6 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-        {{- with .Values.extraContainers }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
       volumes:
         - name: scripts
           configMap:
@@ -271,3 +226,4 @@ spec:
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+{{- end }}
