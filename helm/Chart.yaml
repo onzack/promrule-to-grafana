@@ -2,8 +2,8 @@ apiVersion: v2
 name: promrule-to-grafana
 description: Continuously mirrors PrometheusRule alerting rules from all namespaces into a Grafana instance as Grafana-managed alert rules, using mimirtool against the Grafana /api/convert/ endpoint.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.7
+appVersion: "0.1.7"
 kubeVersion: ">=1.25.0-0"
 keywords:
   - prometheus

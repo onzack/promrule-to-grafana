@@ -211,17 +211,17 @@ securityContext:
 
 resources: {}
   # requests:
-  #   cpu: 10m
-  #   memory: 64Mi
+  #   cpu: 20m
+  #   memory: 32Mi
   # limits:
-  #   memory: 256Mi
+  #   memory: 64Mi
 
 initResources: {}
   # requests:
-  #   cpu: 50m
+  #   cpu: 30m
   #   memory: 64Mi
   # limits:
-  #   memory: 256Mi
+  #   memory: 128Mi
 
 # Restarts the pod when the sync loop stops iterating. It deliberately does not
 # fail on sync errors: a bad token or an unreachable Grafana is not fixed by a
