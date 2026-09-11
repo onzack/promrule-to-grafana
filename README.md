@@ -1,5 +1,7 @@
 # PromRule-To-Grafana
 
+![PromRule-To-Grafana](assets/promrule-to-grafana.png)
+
 Mirrors `PrometheusRule` **alerting** rules from every namespace of a cluster into a Grafana instance as Grafana-managed alert rules.
 
 A single-replica Deployment runs a shell loop that, every 30 seconds:
