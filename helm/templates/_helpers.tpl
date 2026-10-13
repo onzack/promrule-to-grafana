@@ -121,6 +121,9 @@ the threshold has to clear timeout plus a couple of intervals.
 {{- define "promrule-to-grafana.heartbeatMaxAge" -}}
 {{- $interval := include "promrule-to-grafana.toSeconds" .Values.sync.interval | int -}}
 {{- $timeout := include "promrule-to-grafana.toSeconds" .Values.sync.timeout | int -}}
+{{- if .Values.recordingRules.enabled -}}
+{{- $timeout = add $timeout (include "promrule-to-grafana.toSeconds" .Values.recordingRules.syncTimeout | int) -}}
+{{- end -}}
 {{- add $timeout (mul $interval 2) -}}
 {{- end -}}
 
@@ -160,6 +163,84 @@ nothing or 401s forever.
 {{- if not .Values.rules.groupNameExpr -}}
 {{- fail "promrule-to-grafana: rules.groupNameExpr must not be empty." -}}
 {{- end -}}
+{{- if .Values.recordingRules.enabled -}}
+{{- range .Values.recordingRules.secretMounts -}}
+{{- if not (and .name .secretName .mountPath) -}}
+{{- fail "promrule-to-grafana: every recordingRules.secretMounts entry needs name, secretName and mountPath." -}}
+{{- end -}}
+{{- end -}}
+{{- if not .Values.recordingRules.existingSecret -}}
+{{- if not (regexMatch "^https?://[^/]+" (.Values.recordingRules.query.url | toString)) -}}
+{{- fail (printf "promrule-to-grafana: recordingRules.query.url must be the http(s) URL of the PromQL API the recording rules are evaluated against (cerberus), got %q." (.Values.recordingRules.query.url | toString)) -}}
+{{- end -}}
+{{- if not (regexMatch "^https?://[^/]+" (.Values.recordingRules.remoteWrite.url | toString)) -}}
+{{- fail (printf "promrule-to-grafana: recordingRules.remoteWrite.url must be the http(s) remote-write URL the results are sent to, got %q." (.Values.recordingRules.remoteWrite.url | toString)) -}}
+{{- end -}}
+{{- if not (has (.Values.recordingRules.remoteWrite.messageVersion | toString) (list "v1" "v2")) -}}
+{{- fail (printf "promrule-to-grafana: recordingRules.remoteWrite.messageVersion must be \"v1\" or \"v2\", got %q." (.Values.recordingRules.remoteWrite.messageVersion | toString)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+yq filter selecting the PrometheusRules this release handles, applied to each
+element of `.items[]`. Binds `$m` to the resource `.metadata`, which the folder
+and group name expressions rely on. Shared by the alerting transform, the
+recording transform and the cleanup Job so that all three agree on the set.
+*/}}
+{{- define "promrule-to-grafana.ruleFilter" -}}
+| .metadata as $m
+| select($m.namespace | test(strenv(INCLUDE_NAMESPACES_REGEX)))
+| select($m.namespace | test(strenv(EXCLUDE_NAMESPACES_REGEX)) | not)
+| select(
+    ($m.annotations // {})
+    | to_entries
+    | any_c(.key == strenv(IGNORE_ANNOTATION) and .value == "true")
+    | not
+  )
+{{- end -}}
+
+{{/* Thanos Ruler image for the recording rule sidecar. */}}
+{{- define "promrule-to-grafana.rulerImage" -}}
+{{- $img := .Values.recordingRules.image -}}
+{{- if $img.digest -}}
+{{- printf "%s@%s" $img.repository $img.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $img.repository $img.tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Thanos Ruler query API configuration (--query.config-file), derived from
+recordingRules.query.url unless recordingRules.query.config overrides it.
+*/}}
+{{- define "promrule-to-grafana.rulerQueryConfig" -}}
+{{- $q := .Values.recordingRules.query -}}
+{{- if $q.config -}}
+{{- toYaml $q.config -}}
+{{- else -}}
+{{- $u := urlParse ($q.url | toString) -}}
+{{- $endpoint := dict "static_configs" (list $u.host) "scheme" $u.scheme -}}
+{{- with (trimSuffix "/" $u.path) -}}
+{{- $_ := set $endpoint "path_prefix" . -}}
+{{- end -}}
+{{- with $q.httpConfig -}}
+{{- $_ := set $endpoint "http_config" . -}}
+{{- end -}}
+{{- toYaml (list $endpoint) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Thanos Ruler remote-write configuration (--remote-write.config-file). */}}
+{{- define "promrule-to-grafana.rulerRemoteWriteConfig" -}}
+{{- $rw := .Values.recordingRules.remoteWrite -}}
+{{- $target := dict "name" "recording-rules" "url" $rw.url -}}
+{{- if eq ($rw.messageVersion | toString) "v2" -}}
+{{- $_ := set $target "protobuf_message" "io.prometheus.write.v2.Request" -}}
+{{- end -}}
+{{- $target = merge $target (deepCopy ($rw.extraConfig | default dict)) -}}
+{{- toYaml (dict "remote_write" (list $target)) -}}
 {{- end -}}
 
 {{- define "promrule-to-grafana.hookAnnotations" -}}

@@ -25,3 +25,10 @@ spec:
       labels:
         severity: none
         testLabelInAlert: test
+  - name: test-recording-group
+    interval: 30s
+    rules:
+    - record: test:up:count
+      expr: count(up)
+      labels:
+        testLabelInRecord: test

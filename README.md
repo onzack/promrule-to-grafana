@@ -2,12 +2,12 @@
 
 ![PromRule-To-Grafana](assets/promrule-to-grafana.png)
 
-Mirrors `PrometheusRule` **alerting** rules from every namespace of a cluster into a Grafana instance as Grafana-managed alert rules.
+Mirrors `PrometheusRule` **alerting** rules from every namespace of a cluster into a Grafana instance as Grafana-managed alert rules. Optionally, it evaluates **recording** rules with a Thanos Ruler sidecar and remote-writes the results, so dashboards built on recorded series keep working without a Prometheus server.
 
 A single-replica Deployment runs a shell loop that, every 30 seconds:
 
 1. lists `PrometheusRules` across all namespaces with `kubectl`,
-2. reshapes them with `yq`, keeping alerting rules and dropping recording rules,
+2. reshapes them with `yq`, keeping alerting rules and dropping recording rules (or handing them to the ruler sidecar),
 3. validates the result with `mimirtool rules check`,
 4. pushes it with `mimirtool rules sync` when the rule set changed.
 
@@ -46,6 +46,24 @@ helm install rule-sync ./charts/promrule-to-grafana \
 ```
 
 The chart refuses to render without a token, rather than deploying something that would return 401 forever.
+
+## Recording rules
+
+Set `recordingRules.enabled=true` to evaluate the `record:` rules as well. A `thanos rule` sidecar in stateless mode:
+
+- queries a Prometheus-compatible API such as [cerberus](https://github.com/tsouza/cerberus),
+- sends every result via Prometheus remote-write 2.0, for example to the OpenTelemetry Collector `prometheus_remote_write` receiver, which writes them to ClickHouse.
+
+Recorded series keep the names and labels Prometheus gave them, so existing dashboards work unchanged. Alerting rules keep going to Grafana. This needs neither prometheus-operator nor any further CRDs.
+
+```console
+helm upgrade rule-sync ./charts/promrule-to-grafana --reuse-values \
+  --set recordingRules.enabled=true \
+  --set recordingRules.query.url=http://cerberus.cerberus.svc:8080 \
+  --set recordingRules.remoteWrite.url=http://otel-collector.opentelemetry.svc:9090/api/v1/write
+```
+
+See the [chart README](helm/README.md#recording-rules) for the collector configuration and the caveats.
 
 ## Configuration
 

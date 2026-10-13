@@ -43,6 +43,9 @@ spec:
         {{- if and .Values.grafana.auth.token (not .Values.grafana.auth.existingSecret) }}
         checksum/auth-secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
         {{- end }}
+        {{- if and .Values.recordingRules.enabled (not .Values.recordingRules.existingSecret) }}
+        checksum/ruler-config: {{ include (print $.Template.BasePath "/ruler-secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with (merge (dict) .Values.podAnnotations .Values.commonAnnotations) }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -204,6 +207,15 @@ spec:
             - name: GRAFANA_TLS_CA_PATH
               value: /etc/grafana-ca/{{ .Values.grafana.tls.caSecretKey }}
             {{- end }}
+            {{- if .Values.recordingRules.enabled }}
+            # Recording rules, evaluated by the thanos-ruler sidecar
+            - name: RECORDING_RULES_DIR
+              value: /recording-rules
+            - name: RULER_URL
+              value: {{ printf "http://127.0.0.1:%v" .Values.recordingRules.httpPort | quote }}
+            - name: RECORDING_SYNC_TIMEOUT_SECONDS
+              value: {{ include "promrule-to-grafana.toSeconds" .Values.recordingRules.syncTimeout | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -242,9 +254,75 @@ spec:
               mountPath: /etc/grafana-ca
               readOnly: true
             {{- end }}
+            {{- if .Values.recordingRules.enabled }}
+            - name: recording-rules
+              mountPath: /recording-rules
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+        {{- if .Values.recordingRules.enabled }}
+        # Evaluates the recording rules rendered by the sync container against
+        # the query API and remote-writes the results. Stateless mode: no local
+        # TSDB, only a remote-write WAL on an emptyDir.
+        - name: thanos-ruler
+          image: {{ include "promrule-to-grafana.rulerImage" . }}
+          imagePullPolicy: {{ .Values.recordingRules.image.pullPolicy }}
+          args:
+            - rule
+            - --log.level={{ .Values.recordingRules.logLevel }}
+            - --data-dir=/data
+            - --rule-file=/recording-rules/*.yml
+            - --eval-interval={{ .Values.recordingRules.evalInterval }}
+            - --query.config-file=/etc/thanos-ruler/query.yaml
+            - --query.http-method={{ .Values.recordingRules.query.httpMethod }}
+            - --remote-write.config-file=/etc/thanos-ruler/remote-write.yaml
+            - --http-address=0.0.0.0:{{ .Values.recordingRules.httpPort }}
+            {{- range $k, $v := .Values.recordingRules.externalLabels }}
+            - {{ printf "--label=%s=%q" $k ($v | toString) | quote }}
+            {{- end }}
+            {{- range .Values.recordingRules.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http-ruler
+              containerPort: {{ .Values.recordingRules.httpPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http-ruler
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http-ruler
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.recordingRules.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: recording-rules
+              mountPath: /recording-rules
+              readOnly: true
+            - name: ruler-config
+              mountPath: /etc/thanos-ruler
+              readOnly: true
+            - name: ruler-data
+              mountPath: /data
+            {{- range .Values.recordingRules.secretMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+              readOnly: true
+            {{- end }}
+        {{- end }}
         {{- with .Values.extraContainers }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -267,6 +345,32 @@ spec:
         - name: grafana-ca
           secret:
             secretName: {{ .Values.grafana.tls.caSecret }}
+        {{- end }}
+        {{- if .Values.recordingRules.enabled }}
+        - name: recording-rules
+          emptyDir: {}
+        - name: ruler-config
+          secret:
+            {{- if .Values.recordingRules.existingSecret }}
+            secretName: {{ .Values.recordingRules.existingSecret }}
+            items:
+              - key: {{ .Values.recordingRules.existingSecretQueryKey }}
+                path: query.yaml
+              - key: {{ .Values.recordingRules.existingSecretRemoteWriteKey }}
+                path: remote-write.yaml
+            {{- else }}
+            secretName: {{ include "promrule-to-grafana.fullname" . }}-ruler
+            {{- end }}
+        {{- range .Values.recordingRules.secretMounts }}
+        - name: {{ .name }}
+          secret:
+            secretName: {{ .secretName }}
+        {{- end }}
+        - name: ruler-data
+          emptyDir:
+            {{- with .Values.recordingRules.dataSizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

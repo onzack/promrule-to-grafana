@@ -1,0 +1,28 @@
+# Recording rules enabled: a Thanos Ruler sidecar evaluates the PrometheusRule
+# recording rules against cerberus and remote-writes the results (RW 2.0) to
+# the OpenTelemetry Collector `prometheus_remote_write` receiver.
+grafana:
+  url: http://grafana.monitoring.svc.cluster.local:3000
+  datasourceUID: cerberus
+  auth:
+    token: ci-placeholder-token
+
+recordingRules:
+  enabled: true
+  query:
+    url: http://cerberus.cerberus.svc.cluster.local:8080
+  remoteWrite:
+    url: http://otel-collector.opentelemetry.svc.cluster.local:9090/api/v1/write
+    extraConfig:
+      queue_config:
+        max_samples_per_send: 2000
+  # Exercises --label rendering. Leave empty in production so recorded series
+  # match what Prometheus produced.
+  externalLabels:
+    ruler: promrule-to-grafana
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi

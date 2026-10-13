@@ -164,15 +164,7 @@ data:
         '
         [
           .items[]
-          | .metadata as $m
-          | select($m.namespace | test(strenv(INCLUDE_NAMESPACES_REGEX)))
-          | select($m.namespace | test(strenv(EXCLUDE_NAMESPACES_REGEX)) | not)
-          | select(
-              ($m.annotations // {})
-              | to_entries
-              | any_c(.key == strenv(IGNORE_ANNOTATION) and .value == "true")
-              | not
-            )
+          {{- include "promrule-to-grafana.ruleFilter" . | nindent 10 }}
           | {
               "namespace": ({{ $namespaceExpr }}),
               "groups": [
@@ -319,6 +311,188 @@ data:
       echo "push completed"
     fi
 
+{{- if .Values.recordingRules.enabled }}
+  sync-recording-rules.sh: |
+    #!/bin/sh
+    # Renders every recording rule of the matching PrometheusRules into plain
+    # Prometheus rule files for the Thanos Ruler sidecar, and reloads the ruler
+    # when they changed. A rule set the ruler rejects is rolled back to the last
+    # one it loaded, so the sidecar keeps evaluating the previous rules.
+    set -eu
+    if [ "${DEBUG:-false}" = "true" ]; then
+      set -x
+    fi
+
+    : "${TOOLS_DIR:=/tools}"
+    : "${STATE_DIR:=/tmp/state}"
+    : "${RECORDING_RULES_DIR:=/recording-rules}"
+    : "${RULER_URL:=http://127.0.0.1:10902}"
+
+    PATH="${TOOLS_DIR}:${PATH}"
+    export PATH
+
+    stage_dir="${STATE_DIR}/recording-rules.stage"
+    loaded_dir="${STATE_DIR}/recording-rules.loaded"
+    hash_file="${STATE_DIR}/recording-rules.sha256"
+    rejected_file="${STATE_DIR}/recording-rules.rejected.sha256"
+    raw_file="${STATE_DIR}/prometheusrules-recording.json"
+    reload_out="${STATE_DIR}/recording-rules.reload"
+    rejected_out="${STATE_DIR}/recording-rules.rejected"
+
+    mkdir -p "${STATE_DIR}" "${loaded_dir}"
+    rm -rf "${stage_dir}"
+    mkdir -p "${stage_dir}"
+
+    # ------------------------------------------------ 1. read from the cluster
+    set -- prometheusrules.monitoring.coreos.com --all-namespaces --output=json
+    if [ -n "${RULE_LABEL_SELECTOR:-}" ]; then
+      set -- "$@" "--selector=${RULE_LABEL_SELECTOR}"
+    fi
+    kubectl get "$@" > "${raw_file}"
+
+    # -------------------------------------------------------- 2. transform
+    # Keeps recording rules only. A rule counts as recording only if it has a
+    # non-empty `record` and no `alert` at all, mirroring the alerting filter,
+    # so no rule is ever evaluated by both Grafana and the ruler.
+    #
+    # One file per PrometheusRule: Prometheus requires group names to be unique
+    # within a file only, so groups of different resources cannot collide even
+    # when rules.groupNameExpr is plain `.name`. The `file` key only routes each
+    # document to its file and is deleted afterwards, because the Prometheus
+    # rule parser rejects unknown keys.
+    (
+      cd "${stage_dir}"
+      yq --input-format=json --output-format=yaml \
+        --split-exp '.file' \
+        '
+        .items[]
+        {{- include "promrule-to-grafana.ruleFilter" . | nindent 8 }}
+        | {
+            "file": (($m.namespace + "_" + $m.name | sub("[^A-Za-z0-9_.-]", "_")) + ".yml"),
+            "groups": [
+              .spec.groups[]
+              | {
+                  "name": ({{ .Values.rules.groupNameExpr }}),
+                  "interval": .interval,
+                  "rules": [
+                    .rules[]
+                    | select(has("record") and (has("alert") | not))
+                    | select((.record // "") != "")
+                    | pick(["record", "expr", "labels"])
+                  ]
+                }
+              | with_entries(select(.value != null))
+              | select(.rules | length > 0)
+            ]
+          }
+        | select(.groups | length > 0)
+        ' "${raw_file}"
+    )
+
+    # An unmatched glob stays literal in POSIX sh, so probe before using it.
+    set -- "${stage_dir}"/*.yml
+    [ -e "$1" ] || set --
+    for f in "$@"; do
+      yq -i 'del(.file)' "${f}"
+    done
+
+    if [ "$#" -eq 0 ]; then
+      groups=0
+      rules=0
+    else
+      groups="$(yq ea '[.groups[]] | length' "$@")"
+      rules="$(yq ea '[.groups[].rules[]] | length' "$@")"
+    fi
+
+    # ---------------------------------------- 3. decide whether to reload
+    # The ruler re-reads the shared volume by itself when its container
+    # restarts, so an unchanged rule set never needs another reload.
+    dir_hash() {
+      (
+        cd "$1" || exit 1
+        for f in *.yml; do
+          [ -e "${f}" ] || continue
+          printf '%s\n' "${f}"
+          cat "${f}"
+        done | sha256sum | cut -d' ' -f1
+      )
+    }
+    new_hash="$(dir_hash "${stage_dir}")"
+    old_hash="$(cat "${hash_file}" 2>/dev/null || echo "")"
+
+    if [ "${new_hash}" = "${old_hash}" ]; then
+      echo "recording rules unchanged (${new_hash}): ${rules} rule(s) in ${groups} group(s)"
+      exit 0
+    fi
+    if [ "${new_hash}" = "$(cat "${rejected_file}" 2>/dev/null || echo "")" ]; then
+      echo "recording rules (${new_hash}) were already rejected by the ruler and are not retried" \
+           "until a PrometheusRule changes; the ruler keeps evaluating ${old_hash:-no rules}:" >&2
+      cat "${rejected_out}" >&2 2>/dev/null || true
+      exit 1
+    fi
+
+    echo "recording rules changed (${old_hash:-none} -> ${new_hash}): ${rules} rule(s) in ${groups} group(s)"
+    if [ "${DRY_RUN:-false}" = "true" ]; then
+      echo "dry run: the ruler was not reloaded"
+      exit 0
+    fi
+
+    # ------------------------------------------------ 4. load into the ruler
+    # Replaces the rule files on the shared volume. The volume root is a mount
+    # point, so its content is swapped rather than the directory itself.
+    install_rules() {
+      find "${RECORDING_RULES_DIR}" -mindepth 1 -maxdepth 1 -name '*.yml' -exec rm -f {} +
+      for f in "$1"/*.yml; do
+        [ -e "${f}" ] || continue
+        cp "${f}" "${RECORDING_RULES_DIR}/"
+      done
+    }
+
+    # Returns 0 when the ruler accepted the rules, 1 when it rejected them and
+    # 2 when it could not be reached.
+    reload_ruler() {
+      _code="$(
+        curl --silent --show-error --max-time 60 --request POST \
+             --output "${reload_out}" --write-out '%{http_code}' \
+             "${RULER_URL}/-/reload"
+      )" || return 2
+      case "${_code}" in
+        2??) return 0 ;;
+        *) echo "HTTP ${_code}" >> "${reload_out}"; return 1 ;;
+      esac
+    }
+
+    install_rules "${stage_dir}"
+    rc=0
+    reload_ruler || rc=$?
+    case "${rc}" in
+      0)
+        rm -rf "${loaded_dir}"
+        mv "${stage_dir}" "${loaded_dir}"
+        echo "${new_hash}" > "${hash_file}"
+        rm -f "${rejected_file}"
+        echo "ruler reloaded"
+        ;;
+      2)
+        # The new files stay in place: a starting ruler reads them, and the
+        # next iteration reloads again and rolls back if they are rejected.
+        echo "ruler at ${RULER_URL} is unreachable; retrying the reload next iteration" >&2
+        exit 1
+        ;;
+      *)
+        echo "the ruler rejected the recording rules (${new_hash}); rolling back to ${old_hash:-no rules}:" >&2
+        cp "${reload_out}" "${rejected_out}"
+        cat "${rejected_out}" >&2
+        echo "${new_hash}" > "${rejected_file}"
+        install_rules "${loaded_dir}"
+        if ! reload_ruler; then
+          echo "reloading the previous recording rules failed as well" >&2
+        fi
+        exit 1
+        ;;
+    esac
+{{- end }}
+
   loop.sh: |
     #!/bin/sh
     # Runs sync-once.sh forever. A failing iteration is logged and retried on
@@ -351,6 +525,24 @@ data:
             ;;
         esac
       fi
+      {{- if .Values.recordingRules.enabled }}
+
+      # Runs regardless of the alerting result, so that Grafana being down
+      # does not stop recording rule updates and vice versa.
+      if timeout "${RECORDING_SYNC_TIMEOUT_SECONDS:-120}" "${script_dir}/sync-recording-rules.sh"; then
+        :
+      else
+        rc=$?
+        case "${rc}" in
+          124 | 143)
+            echo "recording rule sync timed out after ${RECORDING_SYNC_TIMEOUT_SECONDS:-120}s; retrying in ${SYNC_INTERVAL_SECONDS}s" >&2
+            ;;
+          *)
+            echo "recording rule sync failed with exit code ${rc}; retrying in ${SYNC_INTERVAL_SECONDS}s" >&2
+            ;;
+        esac
+      fi
+      {{- end }}
 
       # Marks the loop as alive regardless of the iteration result, so the
       # liveness probe restarts a stuck loop but leaves a pod that is merely
@@ -455,15 +647,7 @@ data:
       kubectl get "$@" > "${raw_file}"
       yq --input-format=json -r '
         .items[]
-        | .metadata as $m
-        | select($m.namespace | test(strenv(INCLUDE_NAMESPACES_REGEX)))
-        | select($m.namespace | test(strenv(EXCLUDE_NAMESPACES_REGEX)) | not)
-        | select(
-            ($m.annotations // {})
-            | to_entries
-            | any_c(.key == strenv(IGNORE_ANNOTATION) and .value == "true")
-            | not
-          )
+        {{- include "promrule-to-grafana.ruleFilter" . | nindent 8 }}
         | ({{ $namespaceExpr }})
       ' "${raw_file}" >> "${ns_file}"
     fi

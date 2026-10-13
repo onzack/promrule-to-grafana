@@ -13,6 +13,19 @@ PrometheusRule alerting rules are mirrored into Grafana every {{ .Values.sync.in
   Selector:    {{ .Values.rules.labelSelector }}
   {{- end }}
 
+{{ if .Values.recordingRules.enabled -}}
+Recording rules are evaluated by the thanos-ruler sidecar:
+
+  Query API:    {{ .Values.recordingRules.query.url }}
+  Remote write: {{ .Values.recordingRules.remoteWrite.url }} (remote-write {{ .Values.recordingRules.remoteWrite.messageVersion }})
+  {{- with .Values.recordingRules.externalLabels }}
+
+WARNING: recordingRules.externalLabels adds labels to every recorded series.
+Dashboards and alerts that match the exact label set Prometheus produced may
+need adjusting.
+  {{- end }}
+
+{{ end -}}
 Follow the sync loop:
 
   kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "promrule-to-grafana.name" . }} -f

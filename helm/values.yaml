@@ -179,6 +179,108 @@ cleanup:
   # folders derived from current PrometheusRules via `rules.namespaceExpr`.
   extraNamespaces: []
 
+# Evaluates PrometheusRule *recording* rules with a Thanos Ruler sidecar in
+# stateless mode. The sidecar queries a Prometheus-compatible API (cerberus)
+# and sends each result via remote-write, for example to the
+# `prometheus_remote_write` receiver of an OpenTelemetry Collector that writes
+# to ClickHouse. Alerting rules are unaffected and keep going to Grafana.
+#
+# The sync loop renders the recording rules into plain Prometheus rule files on
+# a volume shared with the sidecar and calls its /-/reload endpoint when they
+# change. A rule set the ruler rejects is rolled back to the last one it loaded.
+recordingRules:
+  enabled: false
+
+  image:
+    repository: quay.io/thanos/thanos
+    tag: "v0.42.4"
+    # Takes precedence over tag when set, e.g. "sha256:abc...".
+    digest: ""
+    pullPolicy: IfNotPresent
+
+  # Default evaluation interval for groups that do not set `interval`.
+  evalInterval: 1m
+
+  query:
+    # Base URL of the PromQL HTTP API the rules are evaluated against, without
+    # the /api/v1 suffix. A path component becomes the query path prefix.
+    # Required when enabled, e.g. "http://cerberus.cerberus.svc:8080".
+    url: ""
+    # HTTP method for /api/v1/query. Thanos defaults to POST; switch to GET if
+    # the query API rejects form-encoded POST requests.
+    httpMethod: POST
+    # Optional Prometheus `http_config` (basic_auth, bearer_token_file,
+    # tls_config, ...) for the query API.
+    httpConfig: {}
+    # Full Thanos query API configuration, replacing everything derived from
+    # `url` and `httpConfig` above. See
+    # https://thanos.io/tip/components/rule.md/#query-api
+    config: []
+
+  remoteWrite:
+    # Full remote-write URL, path included. The OpenTelemetry Collector
+    # `prometheus_remote_write` receiver listens on /api/v1/write.
+    # Required when enabled, e.g.
+    # "http://otel-collector.opentelemetry.svc:9090/api/v1/write".
+    url: ""
+    # "v2" sends Prometheus remote-write 2.0 (io.prometheus.write.v2.Request),
+    # the only version the OpenTelemetry receiver accepts. Use "v1" for
+    # Prometheus, Mimir, VictoriaMetrics and other v1-only receivers.
+    messageVersion: v2
+    # Merged into the generated Prometheus `remote_write` entry, e.g.
+    # headers, basic_auth, tls_config or queue_config. Rendered into a Secret.
+    extraConfig: {}
+
+  # Existing Secret holding the complete ruler configuration, e.g. produced by
+  # an ExternalSecret. When set, the chart renders no ruler Secret and ignores
+  # query.url/httpConfig/config and remoteWrite.url/messageVersion/extraConfig.
+  # The ruler reads these files only at startup: restart the pod after the
+  # Secret changes (or use a tool such as stakater/reloader).
+  existingSecret: ""
+  # Key holding the Thanos query API config (a list, see query.config).
+  existingSecretQueryKey: query.yaml
+  # Key holding the Prometheus `remote_write:` config.
+  existingSecretRemoteWriteKey: remote-write.yaml
+
+  # Secrets mounted read-only into the ruler, so that credentials can stay out
+  # of values and be referenced by path from query.httpConfig or
+  # remoteWrite.extraConfig (password_file, bearer_token_file,
+  # authorization.credentials_file, tls_config.ca_file/cert_file/key_file).
+  #
+  # secretMounts:
+  #   - name: otel-auth                     # volume name, unique in the pod
+  #     secretName: otel-remote-write-auth  # e.g. the target of an ExternalSecret
+  #     mountPath: /etc/thanos-ruler-secrets/otel-auth
+  #
+  # Do not mount below /etc/thanos-ruler: that is the read-only config volume.
+  secretMounts: []
+
+  # Labels attached to every recorded series (thanos rule --label). Keep empty
+  # to produce series identical to what Prometheus recorded, so dashboards and
+  # alerts using them match unchanged.
+  externalLabels: {}
+
+  logLevel: info
+
+  # Extra flags appended to `thanos rule`.
+  extraArgs: []
+
+  # HTTP port of the ruler, used for probes, metrics and /-/reload.
+  httpPort: 10902
+
+  # Abort a recording rule sync step that takes longer than this.
+  syncTimeout: 2m
+
+  resources: {}
+    # requests:
+    #   cpu: 50m
+    #   memory: 128Mi
+    # limits:
+    #   memory: 512Mi
+
+  # Size limit for the emptyDir holding the remote-write WAL. Empty means none.
+  dataSizeLimit: ""
+
 serviceAccount:
   create: true
   # Defaults to the fullname of the release when empty.

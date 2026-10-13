@@ -1,11 +1,11 @@
 # PromRule-To-Grafana
 
-Mirrors `PrometheusRule` **alerting** rules from every namespace of a cluster into a Grafana instance as Grafana-managed alert rules.
+Mirrors `PrometheusRule` **alerting** rules from every namespace of a cluster into a Grafana instance as Grafana-managed alert rules. Optionally, **recording** rules are evaluated by a Thanos Ruler sidecar and remote-written to a backend of your choice; see [Recording rules](#recording-rules).
 
 A single-replica Deployment runs a shell loop that, every 30 seconds:
 
 1. lists `PrometheusRules` across all namespaces with `kubectl`,
-2. reshapes them with `yq`, keeping alerting rules and dropping recording rules,
+2. reshapes them with `yq`, keeping alerting rules and dropping recording rules (or handing them to the ruler sidecar),
 3. validates the result with `mimirtool rules check`,
 4. pushes it with `mimirtool rules sync` when the rule set changed.
 
@@ -238,6 +238,103 @@ Any rule group present in Grafana but in neither listing is a leftover. Delete t
 
 Point the old importer's address at a throwaway folder, or remove it entirely, before doing the cleanup, otherwise it will simply push the leftovers back.
 
+## Recording rules
+
+Recording rules are skipped unless `recordingRules.enabled=true`. With it on, a Thanos Ruler sidecar, `thanos rule` in stateless mode, evaluates them:
+
+```text
+PrometheusRule --(sync loop)--> rule files --> thanos rule --query--> cerberus
+                                                    |
+                                       remote-write 2.0
+                                                    v
+                         OpenTelemetry Collector (prometheus_remote_write) --> ClickHouse
+```
+
+Each iteration, the sync loop renders the `record:` rules into one plain Prometheus rule file per `PrometheusRule`, on a volume shared with the sidecar. When the files change, it calls the ruler's `/-/reload`. If the ruler rejects them, the previous rule set is restored and reloaded, and the error is logged on every iteration until a `PrometheusRule` changes.
+
+Alerting and recording rules never overlap. A rule with a non-empty `alert` and no `record` goes to Grafana. A rule with a non-empty `record` and no `alert` goes to the ruler. Everything else is dropped.
+
+The ruler queries `recordingRules.query.url` (cerberus) and writes each result to `recordingRules.remoteWrite.url`. Recorded series keep their name and labels. `recordingRules.externalLabels` is empty by default, so they look exactly like the series Prometheus used to record, and existing dashboards and alerts find them unchanged.
+
+```yaml
+recordingRules:
+  enabled: true
+  query:
+    url: http://cerberus.cerberus.svc:8080
+  remoteWrite:
+    url: http://otel-collector.opentelemetry.svc:9090/api/v1/write
+    messageVersion: v2
+```
+
+### OpenTelemetry Collector
+
+The collector needs the contrib `prometheus_remote_write` receiver, v0.142 or newer, in the metrics pipeline that exports to ClickHouse:
+
+```yaml
+receivers:
+  prometheus_remote_write:
+    endpoint: 0.0.0.0:9090
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp, prometheus, prometheus_remote_write]
+      exporters: [clickhouse]
+```
+
+The receiver accepts remote-write 2.0 only, which is why `messageVersion` defaults to `v2`. Recording-rule output carries no type metadata, and the receiver stores it as gauges in `otel_metrics_gauge`. For a v1-only receiver such as Prometheus, Mimir or VictoriaMetrics, set `messageVersion: v1`.
+
+### Credentials from an existing Secret
+
+The ruler configuration is rendered into a Secret managed by the chart. To keep credentials out of values, for example when an `ExternalSecret` creates them, choose one of the following.
+
+**Mount only the credentials** with `recordingRules.secretMounts`, and reference them by path. The query API config supports `basic_auth.password_file`, `bearer_token_file` and the `tls_config` file options. The remote-write config supports the same, plus `authorization.credentials_file`:
+
+```yaml
+recordingRules:
+  query:
+    url: https://cerberus.example.com
+    httpConfig:
+      basic_auth:
+        username: ruler
+        password_file: /etc/thanos-ruler-secrets/cerberus/password
+  remoteWrite:
+    url: https://otel.example.com/api/v1/write
+    extraConfig:
+      authorization:
+        credentials_file: /etc/thanos-ruler-secrets/otel/token
+  secretMounts:
+    - name: cerberus-auth
+      secretName: cerberus-ruler-auth      # keys: password
+      mountPath: /etc/thanos-ruler-secrets/cerberus
+    - name: otel-auth
+      secretName: otel-remote-write-auth   # keys: token
+      mountPath: /etc/thanos-ruler-secrets/otel
+```
+
+**Or bring the whole configuration** with `recordingRules.existingSecret`. The Secret holds the query API config under `query.yaml` and the `remote_write:` config under `remote-write.yaml`. You can change the key names with `existingSecretQueryKey` and `existingSecretRemoteWriteKey`. In this mode the chart renders no ruler Secret and ignores the `query` and `remoteWrite` values, except `query.httpMethod`. An `ExternalSecret` can produce such a Secret with `target.template`.
+
+The ruler reads both files only at startup, so restart the pod after the Secret content changes, or use a tool such as stakater/reloader. Files referenced through `*_file` options are re-read on every request, so token rotation in `secretMounts` needs no restart.
+
+### Caveats
+
+- **Verify on a few rules first.** This path combines the receiver, which is still alpha, with Thanos's remote-write 2.0 support. Start with one `PrometheusRule`, then check in cerberus that `{__name__="<record>"}` returns the expected labels.
+- **Chained rules may lag.** A recording rule that reads another rule's output now sees it only after the round trip through the collector and ClickHouse, so it can be one evaluation behind.
+- **Some group fields are dropped.** Only `name`, `interval`, `record`, `expr` and `labels` are passed on. `limit` and `query_offset` are not.
+- **Restarts can lose samples.** The remote-write WAL lives on an `emptyDir`, so a pod restart can drop the few samples that were not sent yet.
+- **Unused rules still cost queries.** Every rule queries ClickHouse through cerberus on every evaluation. `cerberus migrate rulegraph` lists which recorded series dashboards and alerts actually read. Exclude unused ones with `rules.labelSelector` or the ignore annotation.
+
+Inspect what the ruler loaded:
+
+```console
+kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafana -c sync \
+  -- sh -c 'cat /recording-rules/*.yml'
+kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafana -c thanos-ruler \
+  -- wget -qO- localhost:10902/api/v1/rules
+```
+
+The ruler's own metrics on port `10902` include `prometheus_remote_storage_samples_failed_total` and `prometheus_rule_evaluation_failures_total`.
+
 ## Operating
 
 ```console
@@ -255,7 +352,7 @@ kubectl exec -n monitoring deploy/rule-sync-promrule-to-grafana \
 
 Set `sync.debug=true` to trace every command with `set -x`.
 
-The liveness probe compares a heartbeat file against `sync.timeout + 2 * sync.interval`. It deliberately reports healthy while sync is failing: it exists to restart a loop that has stopped iterating, not to react to Grafana errors, which are easier to read from a pod that stays up.
+The liveness probe compares a heartbeat file against `sync.timeout + 2 * sync.interval`, plus `recordingRules.syncTimeout` when recording rules are enabled. It deliberately reports healthy while sync is failing: it exists to restart a loop that has stopped iterating, not to react to Grafana errors, which are easier to read from a pod that stays up.
 
 ## Notable values
 
@@ -276,6 +373,15 @@ The liveness probe compares a heartbeat file against `sync.timeout + 2 * sync.in
 | `rules.folder` | `Prometheus Synced Rules` | Single folder for every rule; `""` means one folder per resource |
 | `rules.namespaceExpr` | `$m.namespace + "-" + $m.name` | Folder name expression, used only when `rules.folder` is empty |
 | `rules.groupNameExpr` | `$m.namespace + "-" + $m.name + "-" + .name` | Rule group name; must be unique within a folder |
+| `recordingRules.enabled` | `false` | Evaluate recording rules with a Thanos Ruler sidecar |
+| `recordingRules.query.url` | `""` | PromQL API the rules are evaluated against (cerberus). Required when enabled |
+| `recordingRules.query.httpMethod` | `POST` | Method for `/api/v1/query`; use `GET` if the API rejects POST |
+| `recordingRules.remoteWrite.url` | `""` | Full remote-write URL for the results. Required when enabled |
+| `recordingRules.remoteWrite.messageVersion` | `v2` | `v2` for the OpenTelemetry receiver, `v1` for Prometheus-style receivers |
+| `recordingRules.existingSecret` | `""` | Secret with the complete ruler config (`query.yaml`, `remote-write.yaml`) |
+| `recordingRules.secretMounts` | `[]` | Secrets mounted into the ruler, referenced via `*_file` options |
+| `recordingRules.evalInterval` | `1m` | Interval for groups without their own `interval` |
+| `recordingRules.externalLabels` | `{}` | Labels added to every recorded series; keep empty to match Prometheus |
 | `cleanup.enabled` | `true` | Delete imported Grafana-managed alerts on uninstall |
 | `cleanup.timeout` | `10m` | Deadline for the pre-delete cleanup Job |
 | `cleanup.extraNamespaces` | `[]` | Extra Grafana folder titles to delete on uninstall |

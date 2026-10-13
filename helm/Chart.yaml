@@ -1,9 +1,9 @@
 apiVersion: v2
 name: promrule-to-grafana
-description: Continuously mirrors PrometheusRule alerting rules from all namespaces into a Grafana instance as Grafana-managed alert rules, using mimirtool against the Grafana /api/convert/ endpoint.
+description: Continuously mirrors PrometheusRule alerting rules from all namespaces into a Grafana instance as Grafana-managed alert rules, using mimirtool against the Grafana /api/convert/ endpoint. Optionally evaluates recording rules with a Thanos Ruler sidecar and remote-writes the results.
 type: application
-version: 0.1.7
-appVersion: "0.1.7"
+version: 0.2.0
+appVersion: "0.2.0"
 kubeVersion: ">=1.25.0-0"
 keywords:
   - prometheus
@@ -11,6 +11,8 @@ keywords:
   - grafana
   - alerting
   - mimirtool
+  - recording-rules
+  - thanos
 annotations:
   artifacthub.io/operator: "false"
   artifacthub.io/crds: |
@@ -18,4 +20,4 @@ annotations:
       version: v1
       name: prometheusrules.monitoring.coreos.com
       displayName: Prometheus rule
-      description: Read-only. Alerting rules are read from every namespace and mirrored into Grafana.
+      description: Read-only. Alerting rules are read from every namespace and mirrored into Grafana; recording rules are optionally evaluated by a Thanos Ruler sidecar.
