@@ -199,7 +199,7 @@ recordingRules:
     pullPolicy: IfNotPresent
 
   # Default evaluation interval for groups that do not set `interval`.
-  evalInterval: 1m
+  evalInterval: 30s
 
   query:
     # Base URL of the PromQL HTTP API the rules are evaluated against, without
