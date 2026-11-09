@@ -13,7 +13,7 @@ commonAnnotations: {}
 # The tag tracks the bundled kubectl version.
 image:
   repository: alpine/k8s
-  tag: "1.34.11"
+  tag: "1.36.6"
   # Takes precedence over tag when set, e.g. "sha256:abc...".
   digest: ""
   pullPolicy: IfNotPresent
@@ -40,7 +40,7 @@ tools:
     url: ""
 
   kubectl:
-    # Example: "1.34.1" -> dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+    # Example: "1.36.6" -> dl.k8s.io/release/v1.36.6/bin/linux/amd64/kubectl
     version: ""
     url: ""
 
@@ -193,7 +193,7 @@ recordingRules:
 
   image:
     repository: quay.io/thanos/thanos
-    tag: "v0.42.4"
+    tag: "v0.42.5"
     # Takes precedence over tag when set, e.g. "sha256:abc...".
     digest: ""
     pullPolicy: IfNotPresent

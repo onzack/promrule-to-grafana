@@ -143,7 +143,7 @@ tools:
   mimirtool:
     version: "3.2.1"
   kubectl:
-    version: "1.34.1"
+    version: "1.36.6"
   yq:
     version: "4.47.1"
 ```
